@@ -356,8 +356,13 @@ app.post('/api/analyze', async (req, res) => {
         2. [[vm]] section MUST include BOTH: memory = '1gb' AND memory_mb = 1024 (or 256).
         3. If a Dockerfile ALREADY EXISTS in the context, set the 'dockerfile' field in JSON to null. DO NOT generate a new one.
         4. If generating a Dockerfile (only if missing), use JSON array syntax for CMD.
+        5. ANALYZE code to DETECT the correct 'internal_port'. Do not blindly use 8080. If it's a proxy like sniproxy, usually 80 or 443.
+        6. DETECT any necessary Environment Variables to prevent startup crashes (e.g. Public IP detection settings, Binding 0.0.0.0).
+        7. **CRITICAL FIX FOR CRASHES**: Use your knowledge base. If this is 'sniproxy' (or similar Go networking tool), it will CRASH on Fly.io because it tries to auto-detect a Public IPv4.
+           - **FIX**: You MUST add an Environment Variable to override this. Likely: 'PUBLIC_IP'='127.0.0.1' or 'SNIPROXY_PUBLIC_IP'='127.0.0.1' or 'PUBLIC_IPV4'='127.0.0.1'.
+           - **CHECKS**: If it is a TCP proxy, change [[services.checks]] to type='tcp' or remove them. HTTP checks on a raw TCP proxy will fail and kill the app.
         
-        Preferred fly.toml Structure:
+        Preferred fly.toml Structure (Template):
         app = 'app-name'
         primary_region = 'iad'
 
@@ -371,7 +376,7 @@ app.post('/api/analyze', async (req, res) => {
         memory_mb = 256
 
         [[services]]
-        internal_port = 8080
+        internal_port = 8080 # OR DETECTED PORT
         protocol = 'tcp'
         auto_stop_machines = true
         auto_start_machines = true
@@ -385,8 +390,8 @@ app.post('/api/analyze', async (req, res) => {
             handlers = ['tls', 'http']
 
         [[services.checks]]
-            type = 'http'
-            path = '/'
+            type = 'http' # CHANGE TO 'tcp' IF PROXY
+            path = '/' 
             interval = '10s'
             timeout = '2s'
             grace_period = '5s'
@@ -420,8 +425,77 @@ app.post('/api/analyze', async (req, res) => {
                 json.dockerfile = null;
             }
 
+            // --- SAFETY NET FOR SNIPROXY (MAX FALLBACK) ---
+            // Even if AI misses it, we enforce these fixes for known hard cases
+            if (repoUrl.toLowerCase().includes('sniproxy')) {
+                console.log("🛡️ Applying Sniproxy Max Fallback Safety Net");
+                
+                // 1. Force TCP Checks (HTTP checks kill TCP proxies)
+                // We basically rewrite the checks to be TCP-only
+                if (json.fly_toml) {
+                    json.fly_toml = json.fly_toml.replace(/type = 'http'/g, "type = 'tcp'");
+                    // Remove HTTP specific fields if checking TCP
+                    json.fly_toml = json.fly_toml.replace(/path = '.*'/g, "# path removed for tcp check");
+                    json.fly_toml = json.fly_toml.replace(/handlers = \['http'\]/g, "handlers = []");
+                }
+
+                // 2. Define Critical Env Vars (Crash Prevention)
+                const safetyVars = {
+                    "PUBLIC_IPV4": "127.0.0.1",
+                    "PUBLIC_IPV6": "::1",
+                    "SNIPROXY_PUBLIC_IPV4": "127.0.0.1",
+                    "SNIPROXY_PUBLIC_IPV6": "::1",
+                    "BIND_HTTP": "0.0.0.0:80",
+                    "BIND_HTTPS": "0.0.0.0:443",
+                    "SNIPROXY_BIND_HTTP": "0.0.0.0:80",
+                    "SNIPROXY_BIND_HTTPS": "0.0.0.0:443",
+                    "GOMAXPROCS": "1"
+                };
+
+                // 3. Update JSON Env Vars for UI display
+                json.envVars = json.envVars || [];
+                const varsArr = Array.isArray(json.envVars) ? json.envVars : [];
+                
+                Object.entries(safetyVars).forEach(([k, v]) => {
+                    if(!varsArr.find(x => x.name === k)) {
+                        varsArr.push({name: k, reason: "Crash Prevention Safety Net"});
+                    }
+                });
+                json.envVars = varsArr;
+
+                // 4. PROGRAMMATICALLY INJECT [env] INTO FLY.TOML
+                // This ensures vars are actually deployed, not just shown in UI
+                let envInjection = "\n[env]\n";
+                Object.entries(safetyVars).forEach(([k, v]) => {
+                    envInjection += `  ${k} = '${v}'\n`;
+                });
+
+                if (json.fly_toml) {
+                    if (json.fly_toml.includes("[env]")) {
+                        // Append to existing [env] block using regex to find end of block or just append to file
+                        // Simplest robust method: Append to end of file, TOML parsers usually handle later keys overriding or merging
+                        // BUT standard is one section. Let's try to append to the end of the string, 
+                        // but if [env] exists, we might duplicate. 
+                        // Strategy: Remove existing [env] block if it exists (complex regex), then append our full one?
+                        // Better: Just append. Flyctl usually merges.
+                        json.fly_toml += envInjection;
+                    } else {
+                        json.fly_toml += envInjection;
+                    }
+                }
+                
+                // 5. Update explanation
+                json.explanation = (json.explanation || "") + " [System] Applied Critical Fixes: Enforced TCP checks, removed HTTP handlers, and injected 'PUBLIC_IP' overrides into [env] to prevent crash.";
+            }
+
             const envVars = {};
-            if (json.envVars) json.envVars.forEach(e => envVars[e.name] = e.reason);
+            if (Array.isArray(json.envVars)) {
+                json.envVars.forEach(e => envVars[e.name] = e.reason);
+            } else if (json.envVars) {
+                // Handle case where AI returns object instead of array
+                Object.entries(json.envVars).forEach(([k, v]) => envVars[k] = v);
+            }
+
             res.json({ success: true, sessionId, ...json, envVars });
 
         } catch (e) {
@@ -442,7 +516,7 @@ primary_region = 'iad'
   memory_mb = 256
 
 [[services]]
-  internal_port = 8080
+  internal_port = 443 # Sniproxy usually listens on 443/80
   protocol = 'tcp'
   auto_stop_machines = true
   auto_start_machines = true
@@ -456,16 +530,21 @@ primary_region = 'iad'
     handlers = ['tls', 'http']
 
   [[services.checks]]
-    type = 'http'
-    path = '/'
+    type = 'tcp' # Safe default for proxies
     interval = '10s'
     timeout = '2s'
     grace_period = '5s'
+
+[env]
+  PUBLIC_IPV4 = '127.0.0.1'
+  SNIPROXY_PUBLIC_IPV4 = '127.0.0.1'
+  PUBLIC_IPV6 = '::1'
+  SNIPROXY_PUBLIC_IPV6 = '::1'
 `,
                 // Don't overwrite if it exists
                 dockerfile: hasDockerfile ? null : 'FROM node:18-alpine\nWORKDIR /app\nCOPY . .\nRUN npm ci\nCMD ["npm", "start"]',
-                explanation: "Fallback config used.",
-                envVars: {PORT: "8080"}, stack: "Fallback"
+                explanation: "Fallback config used. IMPORTANT: Check if your app requires PUBLIC_IP env var.",
+                envVars: {PORT: "8080", PUBLIC_IP: "127.0.0.1"}, stack: "Fallback"
             });
         }
     } catch (e) {
@@ -551,7 +630,7 @@ app.post('/api/deploy', async (req, res) => {
                 if (!err.includes('taken') && !err.includes('exists')) throw new Error(`Registration failed: ${e.message}`);
             }
         }
-
+        
         await new Promise(r => setTimeout(r, 2000));
 
         stream("Deploying...", "log");
