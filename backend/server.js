@@ -11,6 +11,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { GoogleGenAI, Type } from "@google/genai";
 import OpenAI from 'openai';
 import { createRequire } from 'module';
+import { pipeline } from 'stream/promises';
 
 const require = createRequire(import.meta.url);
 const AdmZip = require('adm-zip');
@@ -31,10 +32,16 @@ const port = process.env.PORT || 3000;
 
 // Environment Detection
 const IS_VERCEL = process.env.VERCEL === '1';
+const IS_WINDOWS = os.platform() === 'win32';
+const BIN_NAME = IS_WINDOWS ? 'flyctl.exe' : 'flyctl';
+
 const BASE_WORK_DIR = IS_VERCEL ? os.tmpdir() : __dirname;
 const TEMP_DIR = path.join(BASE_WORK_DIR, 'fly_deployer_workspaces');
 const FLY_INSTALL_DIR = path.join(BASE_WORK_DIR, '.fly');
-const FLY_BIN = path.join(FLY_INSTALL_DIR, 'bin', 'flyctl');
+const FLY_BIN = path.join(FLY_INSTALL_DIR, 'bin', BIN_NAME);
+
+// Global Lock for Installation to prevent race conditions
+let isInstalling = false;
 
 app.use(cors());
 app.use(express.json());
@@ -44,14 +51,14 @@ app.use(express.json());
 async function ensureTempDir() {
     try {
         await fs.mkdir(TEMP_DIR, { recursive: true });
-        // Clean up old workspaces if not on Vercel (Vercel cleans /tmp automatically)
+        // Clean up old workspaces if not on Vercel
         if (!IS_VERCEL) {
             const files = await fs.readdir(TEMP_DIR);
             const now = Date.now();
             for (const file of files) {
                 const filePath = path.join(TEMP_DIR, file);
-                const stats = await fs.stat(filePath);
-                if (now - stats.mtimeMs > 3600000) { // 1 hour old
+                const stats = await fs.stat(filePath).catch(() => null);
+                if (stats && now - stats.mtimeMs > 3600000) { // 1 hour old
                     await fs.rm(filePath, { recursive: true, force: true }).catch(() => {});
                 }
             }
@@ -61,63 +68,170 @@ async function ensureTempDir() {
     }
 }
 
-// Ensure temp dir exists on startup
 ensureTempDir();
 
 /**
- * Self-healing binary management.
- * Tries global, then local, then installs if broken.
+ * THE TANK INSTALLER
+ * Maximum fallbacks, aggressive retries, total antifragility.
  */
 async function ensureFlyCtl() {
-    const verify = async (p) => {
-        try {
-            const { stdout } = await execa(p, ['version'], { timeout: 5000 });
-            return stdout.includes('flyctl v');
-        } catch (e) { return false; }
-    };
+    // 0. Wait if another request is currently installing
+    if (isInstalling) {
+        console.log("Waiting for existing installation to complete...");
+        let retries = 0;
+        while (isInstalling && retries < 30) {
+            await new Promise(r => setTimeout(r, 1000));
+            retries++;
+        }
+    }
+    
+    isInstalling = true;
 
-    // 1. Try Global
-    if (await verify('flyctl')) return 'flyctl';
-
-    // 2. Try Local if exists
-    if (existsSync(FLY_BIN) && await verify(FLY_BIN)) return FLY_BIN;
-
-    // 3. Re-install if corrupted or missing
-    console.log("Antifragile Action: Installing/Repairing flyctl...");
     try {
-        const platform = os.platform();
-        const arch = os.arch();
-        let osName = platform === 'darwin' ? 'macOS' : platform === 'win32' ? 'Windows' : 'Linux';
-        let archName = arch === 'arm64' ? 'arm64' : 'x86_64';
+        const verify = async (p) => {
+            try {
+                if (!p || !existsSync(p)) return false;
+                
+                // FORCE executable permissions on Unix
+                if (!IS_WINDOWS) {
+                    try { await fs.chmod(p, 0o755); } catch (e) { /* ignore */ }
+                }
+                
+                const { stdout } = await execa(p, ['version'], { timeout: 5000 });
+                return stdout.includes('flyctl');
+            } catch (e) { 
+                console.log(`Verification failed for ${p}: ${e.message}`);
+                // If verification fails, DESTROY the file to force reinstall
+                try { await fs.unlink(p); } catch {}
+                return false; 
+            }
+        };
+
+        // 1. Try Global
+        if (await verify('flyctl')) { isInstalling = false; return 'flyctl'; }
+
+        // 2. Try Local
+        if (await verify(FLY_BIN)) { isInstalling = false; return FLY_BIN; }
         
-        const releaseRes = await fetch('https://api.github.com/repos/superfly/flyctl/releases/latest');
-        if (!releaseRes.ok) throw new Error("GitHub API Unreachable");
-        const releaseData = await releaseRes.json();
-        const version = releaseData.tag_name.replace(/^v/, '');
-        
-        const assetName = `flyctl_${version}_${osName}_${archName}.tar.gz`;
-        const downloadUrl = `https://github.com/superfly/flyctl/releases/download/v${version}/${assetName}`;
-        
-        const response = await fetch(downloadUrl);
-        if (!response.ok) throw new Error(`Download failed: ${response.status}`);
-        
-        const tgzPath = path.join(BASE_WORK_DIR, `flyctl_repair_${uuidv4()}.tar.gz`);
-        await fs.writeFile(tgzPath, Buffer.from(await response.arrayBuffer()));
-        
+        // 3. Try Home Directory (Default fly install location)
+        const homeFly = path.join(os.homedir(), '.fly', 'bin', BIN_NAME);
+        if (await verify(homeFly)) { isInstalling = false; return homeFly; }
+
+        console.log("⚡ Starting Maximum Fallback Installation Protocol...");
+
+        // Ensure directories exist
         const binDir = path.dirname(FLY_BIN);
         await fs.mkdir(binDir, { recursive: true });
-        
-        if (tar) {
-            await tar.x({ file: tgzPath, cwd: binDir }).catch(() => execa('tar', ['-xzf', tgzPath, '-C', binDir]));
+
+        // --- STRATEGY 1: THE SHELL PIPE (Curl/Wget) ---
+        // Most robust method on Linux/Mac/Containers
+        if (!IS_WINDOWS) {
+            console.log("Trying Strategy 1: Shell Pipe (curl | sh)...");
+            try {
+                // Try curl
+                await execa('sh', ['-c', 'curl -L https://fly.io/install.sh | sh'], {
+                    env: { ...process.env, FLYCTL_INSTALL: FLY_INSTALL_DIR },
+                    stdio: 'inherit'
+                });
+                if (await verify(FLY_BIN)) { isInstalling = false; return FLY_BIN; }
+            } catch (e) { console.warn("Curl failed:", e.message); }
+
+            console.log("Trying Strategy 1b: Shell Pipe (wget | sh)...");
+            try {
+                // Try wget
+                await execa('sh', ['-c', 'wget -qO- https://fly.io/install.sh | sh'], {
+                    env: { ...process.env, FLYCTL_INSTALL: FLY_INSTALL_DIR },
+                    stdio: 'inherit'
+                });
+                if (await verify(FLY_BIN)) { isInstalling = false; return FLY_BIN; }
+            } catch (e) { console.warn("Wget failed:", e.message); }
         } else {
-            await execa('tar', ['-xzf', tgzPath, '-C', binDir]);
+            // Windows Powershell fallback
+            console.log("Trying Strategy 1 (Windows): Powershell Script...");
+            try {
+                await execa('powershell', ['-Command', 'iwr https://fly.io/install.ps1 -useb | iex'], {
+                    env: { ...process.env, FLYCTL_INSTALL: FLY_INSTALL_DIR },
+                    stdio: 'inherit'
+                });
+                if (await verify(FLY_BIN)) { isInstalling = false; return FLY_BIN; }
+            } catch (e) { console.warn("Powershell script failed:", e.message); }
         }
-        
-        await fs.unlink(tgzPath).catch(() => {});
-        if (await verify(FLY_BIN)) return FLY_BIN;
-        throw new Error("Installation failed verification");
-    } catch (error) {
-        throw new Error(`Flyctl Recovery Failed: ${error.message}`);
+
+        // --- STRATEGY 2: DIRECT NODE STREAM ---
+        // Bypasses shell/curl/wget entirely. Useful for minimal node images.
+        console.log("Trying Strategy 2: Direct Node Stream Download...");
+        try {
+            const platform = os.platform();
+            const arch = os.arch();
+            
+            // Precise Mapping
+            let osName = platform === 'darwin' ? 'macOS' : platform === 'win32' ? 'Windows' : 'Linux';
+            let archName = 'x86_64';
+            if (arch === 'arm64') archName = 'arm64';
+            else if (arch === 'x64') archName = 'x86_64';
+            
+            // Get Version
+            const releaseRes = await fetch('https://api.github.com/repos/superfly/flyctl/releases/latest');
+            if (!releaseRes.ok) throw new Error("GitHub API Unreachable");
+            const releaseData = await releaseRes.json();
+            const version = releaseData.tag_name.replace(/^v/, '');
+            
+            const assetName = `flyctl_${version}_${osName}_${archName}.tar.gz`;
+            const downloadUrl = `https://github.com/superfly/flyctl/releases/download/v${version}/${assetName}`;
+            
+            console.log(`Downloading ${downloadUrl}...`);
+            const response = await fetch(downloadUrl);
+            if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
+            
+            const tgzPath = path.join(BASE_WORK_DIR, `flyctl_direct_${uuidv4()}.tar.gz`);
+            
+            // Stream to file to handle large binaries without memory issues
+            const fileStream = createWriteStream(tgzPath);
+            await pipeline(response.body, fileStream);
+            
+            console.log("Extracting...");
+            
+            // Extract Logic
+            if (tar) {
+                await tar.x({ file: tgzPath, cwd: binDir }).catch(() => execa('tar', ['-xzf', tgzPath, '-C', binDir]));
+            } else {
+                await execa('tar', ['-xzf', tgzPath, '-C', binDir]);
+            }
+            
+            await fs.unlink(tgzPath).catch(() => {});
+
+            // Recursive Find & Move (Antifragile against directory structure changes)
+            if (!existsSync(FLY_BIN)) {
+                console.log("Searching for binary...");
+                const findAndMove = async (dir) => {
+                    const entries = await fs.readdir(dir, { withFileTypes: true });
+                    for (const entry of entries) {
+                        const fullPath = path.join(dir, entry.name);
+                        if (entry.isDirectory()) {
+                            if (await findAndMove(fullPath)) return true;
+                        } else if (entry.name === BIN_NAME) {
+                            console.log(`Found at ${fullPath}, relocating...`);
+                            await fs.rename(fullPath, FLY_BIN);
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                await findAndMove(binDir);
+            }
+
+            if (await verify(FLY_BIN)) { isInstalling = false; return FLY_BIN; }
+
+        } catch (e) {
+            console.warn("Strategy 2 failed:", e.message);
+        }
+
+        throw new Error("CRITICAL: All flyctl installation strategies exhausted. Check network/permissions.");
+    } catch (e) {
+        isInstalling = false;
+        throw e;
+    } finally {
+        isInstalling = false;
     }
 }
 
@@ -160,7 +274,7 @@ const GET_SAFE_FALLBACK_CONFIG = (repoUrl) => ({
 // --- Routes ---
 
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime(), env: IS_VERCEL ? 'vercel' : 'node' });
+    res.json({ status: 'ok', uptime: process.uptime(), env: IS_VERCEL ? 'vercel' : 'node', platform: os.platform() });
 });
 
 app.post('/api/analyze', async (req, res) => {
@@ -186,8 +300,6 @@ app.post('/api/analyze', async (req, res) => {
         try {
             repoDir = await downloadRepo(repoUrl, workDir, githubToken);
         } catch (e) {
-            // If download fails, we can't do local analysis. 
-            // Antifragile: Don't give up, try to infer purely from URL if Gemini Search is enabled.
             console.warn("Download failed, attempting pure inference...");
         }
 
@@ -258,7 +370,7 @@ app.post('/api/deploy', async (req, res) => {
     try {
         const flyExe = await ensureFlyCtl();
         const localPath = path.dirname(flyExe);
-        const envPath = `${localPath}:${process.env.PATH}`;
+        const envPath = `${localPath}${path.delimiter}${process.env.PATH}`;
 
         // Ensure Source is present
         try {
@@ -280,7 +392,11 @@ app.post('/api/deploy', async (req, res) => {
         const tomlPath = path.join(targetDir, 'fly.toml');
         let tomlData = flyToml;
         if (preferExistingConfig) {
-            tomlData = await fs.readFile(tomlPath, 'utf8');
+            try {
+                tomlData = await fs.readFile(tomlPath, 'utf8');
+            } catch {
+                throw new Error("Prefer existing config selected, but fly.toml not found in repo.");
+            }
         }
         // Patch toml with current inputs
         tomlData = `app = "${appName}"\nprimary_region = "${region}"\n` + tomlData.replace(/^app\s*=.*$/gm, '').replace(/^primary_region\s*=.*$/gm, '').replace(/^\[app\]\s*$/gm, '');
@@ -288,12 +404,20 @@ app.post('/api/deploy', async (req, res) => {
         if (dockerfile) await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
 
         stream(`Authenticating with Fly.io...`, "info");
+        // Create app - use execa with proper environment
         try {
-            await execa(flyExe, ['apps', 'create', appName], { env: { FLY_API_TOKEN: flyToken, NO_COLOR: "1", PATH: envPath } });
+            await execa(flyExe, ['apps', 'create', appName], { 
+                env: { ...process.env, FLY_API_TOKEN: flyToken, NO_COLOR: "1", PATH: envPath } 
+            });
             stream(`New app '${appName}' registered.`, "success");
         } catch (e) {
-            if (e.stderr?.includes('taken') || e.stderr?.includes('exists')) stream("App already exists, performing update...", "warning");
-            else throw e;
+            // Check for both stdout and stderr for "taken" messages
+            const errStr = (e.stderr || '') + (e.stdout || '') + (e.message || '');
+            if (errStr.includes('taken') || errStr.includes('exists')) {
+                stream("App already exists, performing update...", "warning");
+            } else {
+                throw new Error(`App registration failed: ${e.message}`);
+            }
         }
 
         stream("Launching deployment (Remote Build)...", "log");
@@ -302,8 +426,8 @@ app.post('/api/deploy', async (req, res) => {
             env: { ...process.env, FLY_API_TOKEN: flyToken, NO_COLOR: "1", PATH: envPath }
         });
 
-        deploy.stdout.on('data', c => c.toString().split('\n').forEach(l => l.trim() && stream(l.trim(), 'log')));
-        deploy.stderr.on('data', c => c.toString().split('\n').forEach(l => l.trim() && stream(l.trim(), 'log')));
+        if (deploy.stdout) deploy.stdout.on('data', c => c.toString().split('\n').forEach(l => l.trim() && stream(l.trim(), 'log')));
+        if (deploy.stderr) deploy.stderr.on('data', c => c.toString().split('\n').forEach(l => l.trim() && stream(l.trim(), 'log')));
 
         await deploy;
         
