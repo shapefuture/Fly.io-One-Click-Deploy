@@ -1,12 +1,15 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useDeployStore } from '../store/deployStore';
 import { GlassCard } from './GlassCard';
-import { Github, Key, Globe, ArrowRight, Loader2, Info } from 'lucide-react';
+import { Github, Key, Globe, ArrowRight, Loader2, Info, Bot, Settings2, RefreshCw } from 'lucide-react';
 
 export const InputStep = () => {
-  const { repoUrl, flyToken, appName, region, setInputs, setStep, setSessionId, setConfig, setError } = useDeployStore();
+  const { repoUrl, flyToken, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setError } = useDeployStore();
   const [isLoading, setIsLoading] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [showAiSettings, setShowAiSettings] = useState(false);
+  const [openRouterModels, setOpenRouterModels] = useState<string[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
 
   const normalizeRepoUrl = (input: string) => {
     const trimmed = input.trim();
@@ -17,6 +20,34 @@ export const InputStep = () => {
     return trimmed;
   };
 
+  const fetchOpenRouterModels = async () => {
+    setLoadingModels(true);
+    try {
+      const res = await fetch('https://openrouter.ai/api/v1/models');
+      const data = await res.json();
+      // Filter for free models (pricing.prompt === "0")
+      const freeModels = data.data
+        .filter((m: any) => m.pricing?.prompt === "0" && m.pricing?.completion === "0")
+        .map((m: any) => m.id)
+        .sort();
+      
+      setOpenRouterModels(freeModels);
+      if (!aiConfig.model && freeModels.length > 0) {
+        setAiConfig({ model: freeModels[0] });
+      }
+    } catch (e) {
+      console.error("Failed to fetch models", e);
+    } finally {
+      setLoadingModels(false);
+    }
+  };
+
+  useEffect(() => {
+    if (aiConfig.provider === 'openrouter' && showAiSettings && openRouterModels.length === 0) {
+        fetchOpenRouterModels();
+    }
+  }, [aiConfig.provider, showAiSettings]);
+
   const handleAnalyze = async () => {
     setValidationError(null);
     const finalUrl = normalizeRepoUrl(repoUrl);
@@ -26,19 +57,21 @@ export const InputStep = () => {
         return;
     }
     
-    // Basic Fly token check
     if (!flyToken.startsWith('FlyV1') && !flyToken.startsWith('fo')) {
         setValidationError("That doesn't look like a valid Fly.io Access Token (starts with 'FlyV1' or 'fo').");
-        // We warn but don't block, just in case formats change
     }
 
     if (finalUrl !== repoUrl) setInputs({ repoUrl: finalUrl });
 
+    // Validate AI Config if using BYOK
+    if (aiConfig.provider === 'openrouter' && !aiConfig.apiKey) {
+      setValidationError("OpenRouter API Key is required when OpenRouter provider is selected.");
+      return;
+    }
+
     setIsLoading(true);
     try {
-      // Auto-generate app name if empty
       if (!appName) {
-        // Create a slug from repo name
         const repoName = finalUrl.split('/').pop()?.replace('.git', '') || 'app';
         const randomSuffix = Math.floor(Math.random() * 10000);
         const name = `${repoName.toLowerCase().replace(/[^a-z0-9-]/g, '-')}-${randomSuffix}`;
@@ -48,7 +81,14 @@ export const InputStep = () => {
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repoUrl: finalUrl })
+        body: JSON.stringify({ 
+          repoUrl: finalUrl,
+          aiConfig: {
+            ...aiConfig,
+            // Don't send empty strings if not set, let backend handle defaults for Gemini
+            model: aiConfig.model || undefined
+          }
+        })
       });
       
       const data = await res.json();
@@ -58,7 +98,7 @@ export const InputStep = () => {
       setSessionId(data.sessionId);
       setConfig({
         fly_toml: data.fly_toml,
-        dockerfile: data.dockerfile, // Can be null
+        dockerfile: data.dockerfile,
         explanation: data.explanation,
         envVars: data.envVars || {},
         stack: data.stack || 'Unknown',
@@ -117,7 +157,7 @@ export const InputStep = () => {
 
         <div className="grid md:grid-cols-2 gap-6">
           <div>
-            <label className="block text-sm font-medium text-slate-300 mb-2">App Name (Auto-generated if empty)</label>
+            <label className="block text-sm font-medium text-slate-300 mb-2">App Name (Auto-generated)</label>
             <input
               type="text"
               value={appName}
@@ -146,6 +186,92 @@ export const InputStep = () => {
               </select>
             </div>
           </div>
+        </div>
+
+        {/* AI Configuration Toggle */}
+        <div className="border-t border-white/5 pt-4">
+            <button 
+                onClick={() => setShowAiSettings(!showAiSettings)}
+                className="flex items-center gap-2 text-sm text-slate-400 hover:text-white transition-colors"
+            >
+                <Settings2 className="w-4 h-4" />
+                {showAiSettings ? 'Hide' : 'Show'} Advanced AI Settings (BYOK)
+            </button>
+            
+            {showAiSettings && (
+                <div className="mt-4 p-4 bg-white/5 rounded-lg space-y-4 border border-white/5 animate-fade-in-up">
+                    <div>
+                        <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">AI Provider</label>
+                        <div className="flex gap-4">
+                            <label className={`flex items-center gap-2 cursor-pointer p-3 rounded-lg border transition-all flex-1 ${aiConfig.provider === 'gemini' ? 'bg-blue-500/20 border-blue-500/50 text-white' : 'bg-black/20 border-transparent text-slate-400 hover:bg-white/5'}`}>
+                                <input 
+                                    type="radio" 
+                                    name="provider" 
+                                    className="hidden"
+                                    checked={aiConfig.provider === 'gemini'}
+                                    onChange={() => setAiConfig({ provider: 'gemini' })}
+                                />
+                                <Bot className="w-4 h-4" /> Gemini (Default)
+                            </label>
+                            <label className={`flex items-center gap-2 cursor-pointer p-3 rounded-lg border transition-all flex-1 ${aiConfig.provider === 'openrouter' ? 'bg-purple-500/20 border-purple-500/50 text-white' : 'bg-black/20 border-transparent text-slate-400 hover:bg-white/5'}`}>
+                                <input 
+                                    type="radio" 
+                                    name="provider" 
+                                    className="hidden"
+                                    checked={aiConfig.provider === 'openrouter'}
+                                    onChange={() => setAiConfig({ provider: 'openrouter' })}
+                                />
+                                <Bot className="w-4 h-4" /> OpenRouter
+                            </label>
+                        </div>
+                    </div>
+
+                    <div>
+                        <label className="block text-sm font-medium text-slate-300 mb-2">
+                            {aiConfig.provider === 'gemini' ? 'Gemini API Key (Optional)' : 'OpenRouter API Key'}
+                        </label>
+                        <input
+                            type="password"
+                            value={aiConfig.apiKey}
+                            onChange={(e) => setAiConfig({ apiKey: e.target.value })}
+                            placeholder={aiConfig.provider === 'gemini' ? "Leave empty to use server default" : "sk-or-..."}
+                            className="w-full bg-black/50 border border-white/10 rounded-lg px-4 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+                        />
+                    </div>
+
+                    {aiConfig.provider === 'openrouter' && (
+                        <div className="space-y-2">
+                             <div className="flex justify-between items-center">
+                                <label className="block text-sm font-medium text-slate-300">Model Selection</label>
+                                <button onClick={fetchOpenRouterModels} className="text-xs text-blue-400 flex items-center gap-1 hover:text-blue-300">
+                                    <RefreshCw className={`w-3 h-3 ${loadingModels ? 'animate-spin' : ''}`} /> Refresh Free Models
+                                </button>
+                             </div>
+                             
+                             <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                <select 
+                                    value={aiConfig.model} 
+                                    onChange={(e) => setAiConfig({ model: e.target.value })}
+                                    className="bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-purple-500"
+                                >
+                                    <option value="">Select a free model...</option>
+                                    {openRouterModels.map(m => (
+                                        <option key={m} value={m}>{m}</option>
+                                    ))}
+                                </select>
+                                <input 
+                                    type="text"
+                                    value={aiConfig.model}
+                                    onChange={(e) => setAiConfig({ model: e.target.value })}
+                                    placeholder="Or type custom model ID..."
+                                    className="bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-purple-500"
+                                />
+                             </div>
+                             <p className="text-xs text-slate-500">Select from the dropdown or type any OpenRouter model ID.</p>
+                        </div>
+                    )}
+                </div>
+            )}
         </div>
 
         {validationError && (

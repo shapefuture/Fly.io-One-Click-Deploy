@@ -7,6 +7,14 @@ interface DeployState {
   flyToken: string;
   appName: string;
   region: string;
+  
+  // AI Configuration
+  aiConfig: {
+    provider: 'gemini' | 'openrouter';
+    apiKey: string;
+    model: string;
+  };
+
   sessionId: string | null;
   generatedConfig: {
     fly_toml: string;
@@ -23,6 +31,7 @@ interface DeployState {
 
   setStep: (step: DeployState['currentStep']) => void;
   setInputs: (inputs: Partial<Pick<DeployState, 'repoUrl' | 'flyToken' | 'appName' | 'region'>>) => void;
+  setAiConfig: (config: Partial<DeployState['aiConfig']>) => void;
   setSessionId: (id: string) => void;
   setConfig: (config: DeployState['generatedConfig']) => void;
   addLog: (log: { message: string; type: string }) => void;
@@ -37,6 +46,13 @@ export const useDeployStore = create<DeployState>((set) => ({
   flyToken: '',
   appName: '',
   region: 'iad',
+  
+  aiConfig: {
+    provider: 'gemini',
+    apiKey: '',
+    model: ''
+  },
+
   sessionId: null,
   generatedConfig: null,
   logs: [],
@@ -45,6 +61,7 @@ export const useDeployStore = create<DeployState>((set) => ({
 
   setStep: (step) => set({ currentStep: step }),
   setInputs: (inputs) => set((state) => ({ ...state, ...inputs })),
+  setAiConfig: (config) => set((state) => ({ aiConfig: { ...state.aiConfig, ...config } })),
   setSessionId: (id) => set({ sessionId: id }),
   setConfig: (config) => set({ generatedConfig: config }),
   addLog: (log) => set((state) => ({ logs: [...state.logs, { ...log, type: log.type as any }] })),

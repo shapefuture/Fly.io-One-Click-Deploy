@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import simpleGit from 'simple-git';
 import { v4 as uuidv4 } from 'uuid';
 import { GoogleGenAI, Type } from "@google/genai";
+import OpenAI from 'openai';
 
 dotenv.config();
 
@@ -131,10 +132,20 @@ async function readConfigFiles(dir) {
     return content;
 }
 
+// Clean markdown JSON if OpenRouter returns it
+function cleanJson(text) {
+    if (!text) return "";
+    let cleaned = text.trim();
+    if (cleaned.startsWith('```json')) cleaned = cleaned.replace(/^```json/, '');
+    if (cleaned.startsWith('```')) cleaned = cleaned.replace(/^```/, '');
+    if (cleaned.endsWith('```')) cleaned = cleaned.replace(/```$/, '');
+    return cleaned.trim();
+}
+
 // --- Routes ---
 
 app.post('/api/analyze', async (req, res) => {
-    const { repoUrl } = req.body;
+    const { repoUrl, aiConfig } = req.body;
     if (!repoUrl) return res.status(400).json({ error: 'Repo URL is required' });
 
     const sessionId = uuidv4();
@@ -185,40 +196,81 @@ app.post('/api/analyze', async (req, res) => {
         Output JSON strictly matching the schema.
         `;
 
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const response = await ai.models.generateContent({
-            model: 'gemini-3-pro-preview',
-            contents: prompt,
-            config: {
-                tools: [{ googleSearch: {} }],
-                responseMimeType: "application/json",
-                responseSchema: {
-                    type: Type.OBJECT,
-                    properties: {
-                        fly_toml: { type: Type.STRING },
-                        dockerfile: { type: Type.STRING, nullable: true },
-                        explanation: { type: Type.STRING },
-                        envVars: { 
-                            type: Type.ARRAY,
-                            items: {
-                                type: Type.OBJECT,
-                                properties: {
-                                    name: { type: Type.STRING },
-                                    reason: { type: Type.STRING }
-                                },
-                                required: ["name", "reason"]
-                            }
-                        },
-                        stack: { type: Type.STRING },
-                        healthCheckPath: { type: Type.STRING }
-                    },
-                    required: ["fly_toml", "explanation", "envVars", "stack"]
-                }
-            }
-        });
+        const provider = aiConfig?.provider || 'gemini';
+        let rawResult;
+        let sources = [];
 
-        const rawResult = JSON.parse(response.text.trim());
+        if (provider === 'openrouter') {
+            console.log(`[${sessionId}] Using OpenRouter with model ${aiConfig.model}`);
+            const openai = new OpenAI({
+                baseURL: 'https://openrouter.ai/api/v1',
+                apiKey: aiConfig.apiKey,
+                defaultHeaders: {
+                    'HTTP-Referer': 'https://universal-deployer.fly.dev',
+                    'X-Title': 'Universal Fly Deployer',
+                }
+            });
+
+            const completion = await openai.chat.completions.create({
+                model: aiConfig.model || 'google/gemini-2.0-flash-exp:free',
+                messages: [
+                    { 
+                        role: 'system', 
+                        content: 'You are a DevOps expert. You must output VALID JSON only. Do not output markdown code blocks. The JSON schema is: { fly_toml: string, dockerfile: string|null, explanation: string, envVars: [{name:string, reason:string}], stack: string, healthCheckPath: string }' 
+                    },
+                    { role: 'user', content: prompt }
+                ],
+                response_format: { type: 'json_object' }
+            });
+
+            const content = completion.choices[0].message.content;
+            rawResult = JSON.parse(cleanJson(content));
         
+        } else {
+            // Default to Gemini
+            const apiKey = aiConfig?.apiKey || process.env.API_KEY;
+            console.log(`[${sessionId}] Using Gemini with model ${aiConfig?.model || 'default'}`);
+            
+            const ai = new GoogleGenAI({ apiKey });
+            const response = await ai.models.generateContent({
+                model: aiConfig?.model || 'gemini-3-flash-preview',
+                contents: prompt,
+                config: {
+                    tools: [{ googleSearch: {} }],
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: Type.OBJECT,
+                        properties: {
+                            fly_toml: { type: Type.STRING },
+                            dockerfile: { type: Type.STRING, nullable: true },
+                            explanation: { type: Type.STRING },
+                            envVars: { 
+                                type: Type.ARRAY,
+                                items: {
+                                    type: Type.OBJECT,
+                                    properties: {
+                                        name: { type: Type.STRING },
+                                        reason: { type: Type.STRING }
+                                    },
+                                    required: ["name", "reason"]
+                                }
+                            },
+                            stack: { type: Type.STRING },
+                            healthCheckPath: { type: Type.STRING }
+                        },
+                        required: ["fly_toml", "explanation", "envVars", "stack"]
+                    }
+                }
+            });
+
+            rawResult = JSON.parse(response.text.trim());
+            
+            sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks?.map(chunk => {
+                if (chunk.web) return { title: chunk.web.title, uri: chunk.web.uri };
+                return null;
+            }).filter(Boolean) || [];
+        }
+
         // Transform envVars to object for frontend
         const envVars = {};
         if (Array.isArray(rawResult.envVars)) {
@@ -226,11 +278,6 @@ app.post('/api/analyze', async (req, res) => {
                 if (v && v.name) envVars[v.name] = v.reason || '';
             });
         }
-
-        const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks?.map(chunk => {
-            if (chunk.web) return { title: chunk.web.title, uri: chunk.web.uri };
-            return null;
-        }).filter(Boolean) || [];
 
         res.json({ 
             success: true, 
