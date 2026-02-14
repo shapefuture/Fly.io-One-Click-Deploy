@@ -23,7 +23,8 @@
     "zustand": "^4.5.0",
     "openai": "^4.28.4",
     "adm-zip": "^0.5.10",
-    "@google/genai": "^1.41.0"
+    "@google/genai": "^1.41.0",
+    "tar": "^6.2.0"
   },
   "devDependencies": {
     "@types/react": "^18.2.56",

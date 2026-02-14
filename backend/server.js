@@ -15,7 +15,14 @@ import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
 const AdmZip = require('adm-zip');
-const tar = require('tar');
+let tar;
+try {
+    tar = require('tar');
+} catch (e) {
+    console.error("CRITICAL ERROR: 'tar' dependency is missing.");
+    console.error("Please run 'npm install tar' in the backend directory or root.");
+    process.exit(1);
+}
 
 dotenv.config();
 
@@ -46,6 +53,9 @@ async function ensureTempDir() {
         console.error("Failed to create temp dir:", e);
     }
 }
+
+// Ensure temp dir exists on startup
+ensureTempDir();
 
 // Just-In-Time Installer for Flyctl on Serverless
 // Replaced shell script with pure Node.js implementation to avoid 'tar not found' issues
