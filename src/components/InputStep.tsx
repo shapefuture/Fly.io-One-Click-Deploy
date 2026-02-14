@@ -1,15 +1,26 @@
 import { useState, useEffect } from 'react';
 import { useDeployStore } from '../store/deployStore';
 import { GlassCard } from './GlassCard';
-import { Github, Key, Globe, ArrowRight, Loader2, Info, Bot, Settings2, RefreshCw } from 'lucide-react';
+import { Github, Key, Globe, ArrowRight, Loader2, Info, Bot, Settings2, RefreshCw, Code, Copy, Check } from 'lucide-react';
 
 export const InputStep = () => {
   const { repoUrl, flyToken, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setError } = useDeployStore();
   const [isLoading, setIsLoading] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [showAiSettings, setShowAiSettings] = useState(false);
+  const [showBadgeGenerator, setShowBadgeGenerator] = useState(false);
   const [openRouterModels, setOpenRouterModels] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  // One-Click Deploy Logic: Parse URL params
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const repoParam = params.get('repo');
+    if (repoParam) {
+      setInputs({ repoUrl: repoParam });
+    }
+  }, [setInputs]);
 
   const normalizeRepoUrl = (input: string) => {
     const trimmed = input.trim();
@@ -113,14 +124,56 @@ export const InputStep = () => {
     }
   };
 
+  const generateBadgeCode = () => {
+    const baseUrl = window.location.origin;
+    const targetUrl = repoUrl ? `${baseUrl}?repo=${normalizeRepoUrl(repoUrl)}` : `${baseUrl}?repo=YOUR_GITHUB_URL`;
+    const badgeImage = "https://img.shields.io/badge/deploy%20to-fly.io-4c48db?style=for-the-badge&logo=fly.io";
+    return `[![Deploy to Fly.io](${badgeImage})](${targetUrl})`;
+  };
+
+  const copyBadge = () => {
+    navigator.clipboard.writeText(generateBadgeCode());
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
   return (
     <GlassCard className="w-full max-w-2xl mx-auto space-y-8 animate-fade-in-up">
-      <div className="space-y-2">
-        <h2 className="text-2xl font-bold text-white flex items-center gap-2">
-          <Github className="w-6 h-6" /> Repository Details
-        </h2>
-        <p className="text-slate-400">Point us to your code and we'll handle the rest.</p>
+      <div className="flex justify-between items-start">
+        <div className="space-y-2">
+            <h2 className="text-2xl font-bold text-white flex items-center gap-2">
+            <Github className="w-6 h-6" /> Repository Details
+            </h2>
+            <p className="text-slate-400">Point us to your code and we'll handle the rest.</p>
+        </div>
+        <button 
+            onClick={() => setShowBadgeGenerator(!showBadgeGenerator)}
+            className="text-xs flex items-center gap-1 text-slate-500 hover:text-white transition-colors bg-white/5 px-3 py-1.5 rounded-full border border-white/5"
+        >
+            <Code className="w-3 h-3" /> Get Badge
+        </button>
       </div>
+
+      {showBadgeGenerator && (
+         <div className="p-4 bg-blue-500/10 border border-blue-500/20 rounded-xl space-y-3 animate-fade-in-up">
+            <div className="flex items-center justify-between">
+                <h3 className="text-sm font-bold text-blue-200">One-Click Deploy Button</h3>
+                <span className="text-[10px] text-blue-300/60 uppercase tracking-wider">Markdown</span>
+            </div>
+            <p className="text-xs text-blue-200/70">Add this to your README.md to let others deploy this repo instantly.</p>
+            <div className="flex gap-2">
+                <code className="flex-1 bg-black/40 text-slate-300 p-3 rounded-lg text-xs font-mono break-all border border-white/5">
+                    {generateBadgeCode()}
+                </code>
+                <button 
+                    onClick={copyBadge}
+                    className="bg-blue-600 hover:bg-blue-500 text-white px-3 rounded-lg flex items-center justify-center transition-colors"
+                >
+                    {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                </button>
+            </div>
+         </div>
+      )}
 
       <div className="space-y-6">
         <div>
