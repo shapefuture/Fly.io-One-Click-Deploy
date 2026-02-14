@@ -13,7 +13,7 @@
     "execa": "^8.0.1",
     "express": "^4.19.2",
     "openai": "^4.28.4",
-    "simple-git": "^3.24.0",
+    "adm-zip": "^0.5.10",
     "uuid": "^9.0.1",
     "@google/genai": "^1.41.0"
   }

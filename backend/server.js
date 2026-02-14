@@ -7,11 +7,14 @@ import { createWriteStream } from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
-import simpleGit from 'simple-git';
 import { v4 as uuidv4 } from 'uuid';
 import { GoogleGenAI, Type } from "@google/genai";
 import OpenAI from 'openai';
 import { pipeline } from 'stream/promises';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const AdmZip = require('adm-zip');
 
 dotenv.config();
 
@@ -95,6 +98,43 @@ async function cleanup(dirPath) {
     } catch (e) {
         console.error(`Failed to cleanup ${dirPath}:`, e);
     }
+}
+
+async function downloadRepo(repoUrl, targetDir) {
+    // 1. Construct Archive URL
+    // Remove .git suffix if present
+    const cleanUrl = repoUrl.replace(/\.git$/, '').replace(/\/$/, '');
+    // Use HEAD to get the default branch
+    const archiveUrl = `${cleanUrl}/archive/HEAD.zip`;
+
+    console.log(`Downloading repo from ${archiveUrl}...`);
+    
+    const response = await fetch(archiveUrl);
+    if (!response.ok) {
+        throw new Error(`Failed to download repository: ${response.status} ${response.statusText}`);
+    }
+    
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    
+    // 2. Extract Zip
+    const zip = new AdmZip(buffer);
+    zip.extractAllTo(targetDir, true);
+    
+    // 3. Find root folder
+    // GitHub zips usually extract to a single top-level folder (e.g. repo-main)
+    const entries = await fs.readdir(targetDir);
+    const realEntries = entries.filter(e => !e.startsWith('.')); // Ignore hidden files like .DS_Store
+    
+    if (realEntries.length === 1) {
+        const internalPath = path.join(targetDir, realEntries[0]);
+        const stats = await fs.stat(internalPath);
+        if (stats.isDirectory()) {
+            return internalPath;
+        }
+    }
+    
+    return targetDir;
 }
 
 // --- Helper Functions ---
@@ -202,13 +242,12 @@ app.post('/api/analyze', async (req, res) => {
 
     try {
         await fs.mkdir(workDir, { recursive: true });
-        const git = simpleGit();
         
-        console.log(`[${sessionId}] Cloning ${repoUrl}...`);
-        await git.clone(repoUrl, workDir, ['--depth', '1']);
+        // Replaced git clone with downloadRepo
+        const repoDir = await downloadRepo(repoUrl, workDir);
 
-        const fileStructure = await scanRepoStructure(workDir);
-        const configContent = await readConfigFiles(workDir);
+        const fileStructure = await scanRepoStructure(repoDir);
+        const configContent = await readConfigFiles(repoDir);
 
         const prompt = `
         You are a Lead DevOps Architect. Analyze this repository to generate a deployment configuration for Fly.io.
@@ -344,7 +383,7 @@ app.post('/api/analyze', async (req, res) => {
 });
 
 app.post('/api/deploy', async (req, res) => {
-    const { sessionId, flyToken, flyToml, dockerfile, appName, region } = req.body;
+    const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl } = req.body;
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -356,23 +395,44 @@ app.post('/api/deploy', async (req, res) => {
 
     await ensureTempDir();
     const workDir = path.join(TEMP_DIR, sessionId);
+    let targetDir = workDir;
 
     try {
         // Recover context if on serverless (files might be gone if new instance)
-        // Note: For a robust serverless app, we'd need to re-clone or use persistent storage (S3).
-        // For this workaround, we assume hot-start or we re-create the files.
+        // Check if directory exists and has files
+        let needsDownload = true;
         try {
              await fs.access(workDir);
+             const files = await fs.readdir(workDir);
+             if (files.length > 0) {
+                 // Check if it's the root or if we need to find subdir
+                 const realEntries = files.filter(e => !e.startsWith('.'));
+                 if (realEntries.length === 1 && (await fs.stat(path.join(workDir, realEntries[0]))).isDirectory()) {
+                     targetDir = path.join(workDir, realEntries[0]);
+                 }
+                 needsDownload = false;
+             }
         } catch {
              await fs.mkdir(workDir, { recursive: true });
-             // In a real serverless flow, we'd need to re-clone the repo here.
-             // We'll proceed hoping we just need the config files we are about to write.
         }
 
-        stream("Initializing build environment...", "info");
+        if (needsDownload) {
+             if (repoUrl) {
+                stream("Initializing build context...", "info");
+                try {
+                    targetDir = await downloadRepo(repoUrl, workDir);
+                } catch (e) {
+                    throw new Error(`Failed to download repository context: ${e.message}`);
+                }
+             } else {
+                 stream("Warning: Repository context missing and no URL provided. Deployment may fail if build requires source.", "warning");
+             }
+        }
+
+        stream("Writing configuration...", "info");
 
         // 1. Write Config Files
-        const tomlPath = path.join(workDir, 'fly.toml');
+        const tomlPath = path.join(targetDir, 'fly.toml');
         
         let finalToml = flyToml;
         finalToml = finalToml.replace(/^app\s*=.*$/m, '');
@@ -382,11 +442,9 @@ app.post('/api/deploy', async (req, res) => {
 
         await fs.writeFile(tomlPath, finalToml);
         if (dockerfile) {
-            await fs.writeFile(path.join(workDir, 'Dockerfile'), dockerfile);
+            await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
             stream("Using AI-generated Dockerfile", "info");
         } else {
-            // If we don't have the repo cloned (serverless cold start), this will fail if it relies on repo files.
-            // But we assume for 'deploy' we might just need the context or remote builder.
             stream("Using repository Dockerfile", "info");
         }
 
@@ -399,7 +457,7 @@ app.post('/api/deploy', async (req, res) => {
         
         stream(`Registering app '${appName}' in region '${region}'...`, "info");
         try {
-            await runFlyctl(['apps', 'create', appName, '--org', 'personal'], flyToken, workDir);
+            await runFlyctl(['apps', 'create', appName, '--org', 'personal'], flyToken, targetDir);
             stream(`App '${appName}' created successfully.`, "success");
         } catch (e) {
             if (e && e.message && e.message.includes('taken')) {
@@ -418,7 +476,7 @@ app.post('/api/deploy', async (req, res) => {
         const deployArgs = ['deploy', '--ha=false']; 
         
         const deployProcess = execa(flyExe, deployArgs, {
-            cwd: workDir,
+            cwd: targetDir,
             env: { 
                 ...process.env, 
                 FLY_API_TOKEN: flyToken, 
@@ -440,7 +498,7 @@ app.post('/api/deploy', async (req, res) => {
 
         // 4. Verify
         stream("Verifying deployment status...", "info");
-        const statusCheck = await runFlyctl(['status', '--json'], flyToken, workDir);
+        const statusCheck = await runFlyctl(['status', '--json'], flyToken, targetDir);
         const statusData = JSON.parse(statusCheck.stdout);
 
         res.write(`data: ${JSON.stringify({ 
