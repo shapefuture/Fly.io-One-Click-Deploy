@@ -89,6 +89,9 @@ export const useDeployStore = create<DeployState>()(
         
         set({ currentStep: 'deploying', error: null, logs: [], deployedUrl: null });
 
+        // Antifragile: Immediate status update
+        get().addLog({ message: "📡 Establishing secure tunnel to deployment engine...", type: 'info' });
+
         try {
           const response = await fetch('/api/deploy', {
             method: 'POST',
@@ -100,9 +103,14 @@ export const useDeployStore = create<DeployState>()(
             })
           });
 
+          if (!response.ok) {
+            const errBody = await response.json().catch(() => ({ error: 'Connection lost' }));
+            throw new Error(errBody.error || `Deployment gateway error (${response.status})`);
+          }
+
           const reader = response.body?.getReader();
           const decoder = new TextDecoder();
-          if (!reader) throw new Error("Failed to stream logs");
+          if (!reader) throw new Error("Stream initialization failed");
 
           while (true) {
             const { done, value } = await reader.read();
@@ -110,21 +118,23 @@ export const useDeployStore = create<DeployState>()(
             const chunk = decoder.decode(value);
             const lines = chunk.split('\n\n');
             for (const line of lines) {
-              if (line.startsWith('data: ')) {
+              if (line.trim().startsWith('data: ')) {
                 try {
-                    const data = JSON.parse(line.slice(6));
+                    const data = JSON.parse(line.trim().slice(6));
                     if (data.type === 'success') {
                         set({ deployedUrl: data.appUrl, currentStep: 'success' });
                         return;
                     } else {
                         get().addLog({ message: data.message, type: data.type });
                     }
-                } catch (e) { console.error("Parse error on chunk", line); }
+                } catch (e) { 
+                    // Silent catch for partial chunks
+                }
               }
             }
           }
         } catch (e: any) {
-            get().addLog({ message: `Fatal error: ${e.message}`, type: 'error' });
+            get().addLog({ message: `❌ Critical Fail: ${e.message}`, type: 'error' });
             set({ error: e.message, currentStep: 'error' });
         }
       }

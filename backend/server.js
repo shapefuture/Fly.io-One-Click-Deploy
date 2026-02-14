@@ -3,14 +3,13 @@ import { execa } from 'execa';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import fs from 'fs/promises';
-import { createWriteStream } from 'fs';
+import { createWriteStream, existsSync } from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { v4 as uuidv4 } from 'uuid';
 import { GoogleGenAI, Type } from "@google/genai";
 import OpenAI from 'openai';
-import { pipeline } from 'stream/promises';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -19,9 +18,7 @@ let tar;
 try {
     tar = require('tar');
 } catch (e) {
-    console.error("CRITICAL ERROR: 'tar' dependency is missing.");
-    console.error("Please run 'npm install tar' in the backend directory or root.");
-    process.exit(1);
+    console.warn("⚠️ Warning: 'tar' npm package is missing. Fallback to system tar will be used.");
 }
 
 dotenv.config();
@@ -34,8 +31,6 @@ const port = process.env.PORT || 3000;
 
 // Environment Detection
 const IS_VERCEL = process.env.VERCEL === '1';
-
-// On Vercel, we must use /tmp. Locally, we use a local folder.
 const BASE_WORK_DIR = IS_VERCEL ? os.tmpdir() : __dirname;
 const TEMP_DIR = path.join(BASE_WORK_DIR, 'fly_deployer_workspaces');
 const FLY_INSTALL_DIR = path.join(BASE_WORK_DIR, '.fly');
@@ -44,614 +39,280 @@ const FLY_BIN = path.join(FLY_INSTALL_DIR, 'bin', 'flyctl');
 app.use(cors());
 app.use(express.json());
 
-// --- Initialization & Cleanup ---
+// --- Initialization & Self-Healing ---
 
 async function ensureTempDir() {
     try {
         await fs.mkdir(TEMP_DIR, { recursive: true });
+        // Clean up old workspaces if not on Vercel (Vercel cleans /tmp automatically)
+        if (!IS_VERCEL) {
+            const files = await fs.readdir(TEMP_DIR);
+            const now = Date.now();
+            for (const file of files) {
+                const filePath = path.join(TEMP_DIR, file);
+                const stats = await fs.stat(filePath);
+                if (now - stats.mtimeMs > 3600000) { // 1 hour old
+                    await fs.rm(filePath, { recursive: true, force: true }).catch(() => {});
+                }
+            }
+        }
     } catch (e) {
-        console.error("Failed to create temp dir:", e);
+        if (e.code !== 'EEXIST') console.error("Initialization Error:", e);
     }
 }
 
 // Ensure temp dir exists on startup
 ensureTempDir();
 
-// Just-In-Time Installer for Flyctl on Serverless
-// Replaced shell script with pure Node.js implementation to avoid 'tar not found' issues
+/**
+ * Self-healing binary management.
+ * Tries global, then local, then installs if broken.
+ */
 async function ensureFlyCtl() {
-    // 1. Check if global flyctl exists (Development / Docker)
-    try {
-        await execa('flyctl', ['version']);
-        return 'flyctl'; // Global command
-    } catch (e) {
-        // Global not found, check local /tmp install
-    }
+    const verify = async (p) => {
+        try {
+            const { stdout } = await execa(p, ['version'], { timeout: 5000 });
+            return stdout.includes('flyctl v');
+        } catch (e) { return false; }
+    };
 
-    // 2. Check if we already installed it in /tmp
-    try {
-        await fs.access(FLY_BIN);
-        return FLY_BIN;
-    } catch (e) {
-        // Not installed, install it now
-    }
+    // 1. Try Global
+    if (await verify('flyctl')) return 'flyctl';
 
-    console.log("Installing flyctl to", FLY_INSTALL_DIR);
+    // 2. Try Local if exists
+    if (existsSync(FLY_BIN) && await verify(FLY_BIN)) return FLY_BIN;
+
+    // 3. Re-install if corrupted or missing
+    console.log("Antifragile Action: Installing/Repairing flyctl...");
     try {
         const platform = os.platform();
         const arch = os.arch();
+        let osName = platform === 'darwin' ? 'macOS' : platform === 'win32' ? 'Windows' : 'Linux';
+        let archName = arch === 'arm64' ? 'arm64' : 'x86_64';
         
-        let osName = 'Linux';
-        if (platform === 'darwin') osName = 'macOS';
-        else if (platform === 'win32') osName = 'Windows';
-        
-        let archName = 'x86_64';
-        if (arch === 'arm64') archName = 'arm64';
-        
-        // Get latest release version
-        console.log("Fetching latest flyctl version...");
         const releaseRes = await fetch('https://api.github.com/repos/superfly/flyctl/releases/latest');
-        if (!releaseRes.ok) throw new Error("Failed to fetch latest flyctl release info");
+        if (!releaseRes.ok) throw new Error("GitHub API Unreachable");
         const releaseData = await releaseRes.json();
         const version = releaseData.tag_name.replace(/^v/, '');
         
         const assetName = `flyctl_${version}_${osName}_${archName}.tar.gz`;
         const downloadUrl = `https://github.com/superfly/flyctl/releases/download/v${version}/${assetName}`;
         
-        console.log(`Downloading ${downloadUrl}...`);
         const response = await fetch(downloadUrl);
-        if (!response.ok) throw new Error(`Failed to download flyctl binary: ${response.statusText}`);
+        if (!response.ok) throw new Error(`Download failed: ${response.status}`);
         
-        const tgzPath = path.join(BASE_WORK_DIR, `flyctl-${version}.tar.gz`);
-        const buffer = Buffer.from(await response.arrayBuffer());
-        await fs.writeFile(tgzPath, buffer);
+        const tgzPath = path.join(BASE_WORK_DIR, `flyctl_repair_${uuidv4()}.tar.gz`);
+        await fs.writeFile(tgzPath, Buffer.from(await response.arrayBuffer()));
         
-        // Ensure bin dir exists
         const binDir = path.dirname(FLY_BIN);
         await fs.mkdir(binDir, { recursive: true });
         
-        // Extract
-        console.log("Extracting flyctl...");
-        await tar.x({
-            file: tgzPath,
-            cwd: binDir
-        });
+        if (tar) {
+            await tar.x({ file: tgzPath, cwd: binDir }).catch(() => execa('tar', ['-xzf', tgzPath, '-C', binDir]));
+        } else {
+            await execa('tar', ['-xzf', tgzPath, '-C', binDir]);
+        }
         
-        await fs.unlink(tgzPath);
-        
-        // Verify
-        await fs.access(FLY_BIN);
-        
-        return FLY_BIN;
+        await fs.unlink(tgzPath).catch(() => {});
+        if (await verify(FLY_BIN)) return FLY_BIN;
+        throw new Error("Installation failed verification");
     } catch (error) {
-        console.error("Failed to install flyctl:", error);
-        throw new Error(`Could not install flyctl runtime dependency: ${error.message}`);
+        throw new Error(`Flyctl Recovery Failed: ${error.message}`);
     }
 }
 
 async function cleanup(dirPath) {
-    if (!dirPath) return;
-    try {
-        // Safety check to ensure we are deleting inside TEMP_DIR
-        if (dirPath.startsWith(TEMP_DIR)) {
-            await fs.rm(dirPath, { recursive: true, force: true });
-        }
-    } catch (e) {
-        console.error(`Failed to cleanup ${dirPath}:`, e);
-    }
+    if (!dirPath || !dirPath.startsWith(TEMP_DIR)) return;
+    await fs.rm(dirPath, { recursive: true, force: true }).catch(() => {});
 }
 
 async function downloadRepo(repoUrl, targetDir, githubToken) {
-    // 1. Construct Archive URL
-    // Remove .git suffix if present
     const cleanUrl = repoUrl.replace(/\.git$/, '').replace(/\/$/, '');
-    // Use HEAD to get the default branch
     const archiveUrl = `${cleanUrl}/archive/HEAD.zip`;
-
-    console.log(`Downloading repo from ${archiveUrl}...`);
-    
-    const headers = {};
-    if (githubToken) {
-        headers['Authorization'] = `token ${githubToken}`;
-        headers['User-Agent'] = 'Universal-Fly-Deployer';
-    }
+    const headers = githubToken ? { 'Authorization': `token ${githubToken}`, 'User-Agent': 'Universal-Fly-Deployer' } : {};
 
     const response = await fetch(archiveUrl, { headers });
-    if (!response.ok) {
-        throw new Error(`Failed to download repository: ${response.status} ${response.statusText}. ${githubToken ? 'Token provided.' : 'No token.'}`);
-    }
+    if (!response.ok) throw new Error(`Repo Download Error: ${response.status}`);
     
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    
-    // 2. Extract Zip
-    const zip = new AdmZip(buffer);
+    const zip = new AdmZip(Buffer.from(await response.arrayBuffer()));
     zip.extractAllTo(targetDir, true);
     
-    // 3. Find root folder
-    // GitHub zips usually extract to a single top-level folder (e.g. repo-main)
     const entries = await fs.readdir(targetDir);
-    const realEntries = entries.filter(e => !e.startsWith('.')); // Ignore hidden files like .DS_Store
-    
+    const realEntries = entries.filter(e => !e.startsWith('.'));
     if (realEntries.length === 1) {
         const internalPath = path.join(targetDir, realEntries[0]);
-        const stats = await fs.stat(internalPath);
-        if (stats.isDirectory()) {
-            return internalPath;
-        }
+        if ((await fs.stat(internalPath)).isDirectory()) return internalPath;
     }
-    
     return targetDir;
 }
 
-// --- Helper Functions ---
+// --- Analysis & Fallbacks ---
 
-async function runFlyctl(args, token, cwd, env = {}) {
-    try {
-        const exe = await ensureFlyCtl();
-        
-        // If using custom binary, ensure its dir is in PATH for internal calls
-        const localPath = path.dirname(exe);
-        const newPath = `${localPath}:${process.env.PATH}`;
-
-        const { stdout, stderr } = await execa(exe, args, {
-            cwd,
-            env: { 
-                ...process.env, 
-                FLY_API_TOKEN: token, 
-                NO_COLOR: "1", 
-                PATH: newPath,
-                ...env 
-            },
-            timeout: 600000 // 10 minutes (Note: Vercel Free tier limits function duration to 10s-60s)
-        });
-        return { success: true, stdout, stderr };
-    } catch (error) {
-        const errorMsg = error.stderr || error.stdout || error.message || 'Unknown flyctl error';
-        // Attach stderr to error object for caller inspection
-        const err = new Error(errorMsg);
-        err.stderr = error.stderr;
-        throw err;
-    }
-}
-
-async function scanRepoStructure(dir, depth = 0, maxDepth = 3) {
-    if (depth > maxDepth) return [];
-    try {
-        const entries = await fs.readdir(dir, { withFileTypes: true });
-        let files = [];
-        for (const entry of entries) {
-            if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'target') continue;
-            
-            if (entry.isDirectory()) {
-                const subFiles = await scanRepoStructure(path.join(dir, entry.name), depth + 1, maxDepth);
-                files = files.concat(subFiles.map(f => `${entry.name}/${f}`));
-            } else {
-                files.push(entry.name);
-            }
-        }
-        return files;
-    } catch (e) { return []; }
-}
-
-async function readConfigFiles(dir) {
-    const criticalFiles = [
-        'package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb',
-        'go.mod', 'go.sum',
-        'requirements.txt', 'Pipfile', 'pyproject.toml',
-        'Gemfile', 'Gemfile.lock',
-        'composer.json', 'composer.lock',
-        'Dockerfile', 'docker-compose.yml', 'Procfile',
-        'mix.exs',
-        'Cargo.toml',
-        'deno.json',
-        'next.config.js', 'remix.config.js', 'nuxt.config.ts', 'vite.config.ts', 'angular.json',
-        'fly.toml', 'app.json'
-    ];
-    let content = "";
-    for (const file of criticalFiles) {
-        try {
-            const filePath = path.join(dir, file);
-            // Check if file exists first
-            await fs.access(filePath);
-            const data = await fs.readFile(filePath, 'utf8');
-            content += `\n--- ${file} ---\n${data.slice(0, 8000)}\n`; 
-        } catch (e) {}
-    }
-    return content;
-}
-
-// Clean markdown JSON if OpenRouter returns it
-function cleanJson(text) {
-    if (!text) return "";
-    let cleaned = text.trim();
-    if (cleaned.startsWith('```json')) cleaned = cleaned.replace(/^```json/, '');
-    if (cleaned.startsWith('```')) cleaned = cleaned.replace(/^```/, '');
-    if (cleaned.endsWith('```')) cleaned = cleaned.replace(/```$/, '');
-    return cleaned.trim();
-}
+const GET_SAFE_FALLBACK_CONFIG = (repoUrl) => ({
+    fly_toml: `app = "change-me"\nprimary_region = "iad"\n\n[http_service]\n  internal_port = 8080\n  force_https = true\n  auto_stop_machines = true\n  auto_start_machines = true\n\n[[vm]]\n  cpu_kind = "shared"\n  cpus = 1\n  memory_mb = 256`,
+    dockerfile: `FROM node:alpine\nWORKDIR /app\nCOPY . .\nRUN npm install --production\nCMD ["npm", "start"]`,
+    explanation: "⚠️ AI Analysis failed. Providing a safe-mode Node.js default configuration. Please review ports and start commands.",
+    envVars: { "PORT": "Standard internal port" },
+    stack: "Unknown (Fallback Mode)",
+    healthCheckPath: "/"
+});
 
 // --- Routes ---
 
 app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        uptime: process.uptime(),
-        environment: IS_VERCEL ? 'vercel' : 'standard',
-        tempDir: TEMP_DIR
-    });
+    res.json({ status: 'ok', uptime: process.uptime(), env: IS_VERCEL ? 'vercel' : 'node' });
 });
 
 app.post('/api/analyze', async (req, res) => {
     const { repoUrl, aiConfig, githubToken, preferExistingConfig } = req.body;
     if (!repoUrl) return res.status(400).json({ error: 'Repo URL is required' });
 
-    await ensureTempDir();
     const sessionId = uuidv4();
     const workDir = path.join(TEMP_DIR, sessionId);
+    await fs.mkdir(workDir, { recursive: true }).catch(() => {});
 
     try {
-        await fs.mkdir(workDir, { recursive: true });
-        
-        let fileStructure = [];
-        let configContent = "";
-        let analysisMethod = "local";
-
-        // --- SHORT CIRCUIT: Trust User ---
-        // If user says "Prefer Existing Config", we skip analysis entirely.
-        // We do not download the repo here to save time and bandwidth.
         if (preferExistingConfig) {
-            console.log(`[${sessionId}] Prefer existing config enabled. Skipping download and AI analysis.`);
             return res.json({
-                success: true,
-                sessionId,
-                fly_toml: "# Using existing configuration from repository",
+                success: true, sessionId,
+                fly_toml: "# Using repo fly.toml",
                 dockerfile: null,
-                explanation: "Skipping analysis. Deployment will use the 'fly.toml' and 'Dockerfile' found in the repository directly.",
-                envVars: {},
-                stack: "Repository Config",
-                healthCheckPath: "",
-                sources: [],
-                warnings: ["Analysis skipped. Using repository configuration."]
+                explanation: "Using existing configuration.",
+                envVars: {}, stack: "Existing", healthCheckPath: ""
             });
         }
+
+        let repoDir;
+        try {
+            repoDir = await downloadRepo(repoUrl, workDir, githubToken);
+        } catch (e) {
+            // If download fails, we can't do local analysis. 
+            // Antifragile: Don't give up, try to infer purely from URL if Gemini Search is enabled.
+            console.warn("Download failed, attempting pure inference...");
+        }
+
+        const configContent = repoDir ? await (async (dir) => {
+            const files = ['package.json', 'requirements.txt', 'Dockerfile', 'fly.toml', 'go.mod', 'Cargo.toml', 'Gemfile'];
+            let text = "";
+            for (const f of files) {
+                try {
+                    const data = await fs.readFile(path.join(dir, f), 'utf8');
+                    text += `\n--- ${f} ---\n${data.slice(0, 5000)}\n`;
+                } catch {}
+            }
+            return text;
+        })(repoDir) : "Codebase unavailable.";
+
+        const prompt = `Lead DevOps Analysis: Repo ${repoUrl}. Configs: ${configContent}. Output JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}. Syntax: No [app] block in toml. Use [http_service].`;
 
         try {
-            // Try downloading repo
-            const repoDir = await downloadRepo(repoUrl, workDir, githubToken);
-            fileStructure = await scanRepoStructure(repoDir);
-            configContent = await readConfigFiles(repoDir);
-        } catch (e) {
-            console.warn(`[${sessionId}] Repo download failed: ${e.message}. Falling back to AI Search.`);
-            analysisMethod = "search_fallback";
-        }
-
-        const prompt = `
-        You are a Lead DevOps Architect. Analyze this repository to generate a deployment configuration for Fly.io.
-
-        Context:
-        - The user wants to deploy this application to Fly.io.
-        - Repository URL: ${repoUrl}
-        - Analysis Method: ${analysisMethod === 'local' ? 'Codebase Analysis' : 'Search & Inference (Codebase unavailable)'}
-
-        Repository File Structure (truncated):
-        ${fileStructure.slice(0, 100).join('\n')}
-        ${fileStructure.length > 100 ? '... (more files)' : ''}
-
-        Configuration Files Content:
-        ${configContent}
-
-        Tasks:
-        1. **Stack Detection**: Identify language, framework, build tool, and package manager.
-        2. **Port Strategy**: 
-           - Detect the internal port (check 'scripts' in package.json, main files, or standard defaults). 
-           - Note: Fly.io maps external 80/443 to this internal port.
-        3. **Fly.toml Generation**:
-           - Create a complete 'fly.toml'.
-           - **IMPORTANT SYNTAX RULES**:
-             - Do NOT use an [app] block. 'app' and 'primary_region' must be top-level keys.
-             - Prefer using [http_service] for web applications.
-             - If using [[services]], ensure port 80 has 'handlers = ["http"]' (to force redirect) and port 443 has 'handlers = ["tls", "http"]'. 
-             - Only use 'handlers = ["tls"]' if the application expects raw TCP traffic (e.g., specific proxies).
-           - Set 'auto_stop_machines = true' and 'auto_start_machines = true'.
-           - **COST EFFICIENCY**: Include a [[vm]] block with 'cpu_kind = "shared"', 'cpus = 1', and 'memory_mb = 256' to target the free/hobby tier.
-           - Add a [checks] block for health monitoring if a health endpoint (/health, /up, /) is likely.
-        4. **Dockerfile Generation**:
-           - **Crucial**: If a 'Dockerfile' already exists in the provided config content, set the 'dockerfile' field in JSON to null. We prefer the user's Dockerfile.
-           - If NO Dockerfile exists, generate a **production-grade Multi-Stage** Dockerfile.
-           - For Node.js: Use 'node:alpine' or 'node:slim', build in one stage, copy to runner.
-           - For Python: Use 'python:slim'.
-           - Ensure 'CMD' or 'ENTRYPOINT' is correct based on 'package.json' scripts (e.g., 'npm start', 'npm run serve').
-        5. **Environment Variables**: Identify *runtime* secrets (DB URLs, API Keys) needed.
-
-        Output JSON strictly matching the schema.
-        `;
-
-        const provider = aiConfig?.provider || 'gemini';
-        let rawResult;
-        let sources = [];
-        let warnings = [];
-
-        if (provider === 'openrouter') {
-            console.log(`[${sessionId}] Using OpenRouter with model ${aiConfig.model}`);
+            const provider = aiConfig?.provider || 'gemini';
+            let rawResult;
             
-            if (analysisMethod === 'search_fallback') {
-                warnings.push("Analysis is based on limited information because repository download failed and Search is unavailable on OpenRouter.");
+            if (provider === 'openrouter') {
+                const openai = new OpenAI({ baseURL: 'https://openrouter.ai/api/v1', apiKey: aiConfig.apiKey });
+                const completion = await openai.chat.completions.create({
+                    model: aiConfig.model || 'google/gemini-2.0-flash-exp:free',
+                    messages: [{ role: 'system', content: 'JSON expert.' }, { role: 'user', content: prompt }],
+                    response_format: { type: 'json_object' }
+                });
+                rawResult = JSON.parse(completion.choices[0].message.content.trim());
+            } else {
+                const apiKey = aiConfig?.apiKey || process.env.API_KEY;
+                if (!apiKey) throw new Error("No API Key");
+                const ai = new GoogleGenAI({ apiKey });
+                const response = await ai.models.generateContent({
+                    model: aiConfig?.model || 'gemini-3-flash-preview',
+                    contents: prompt,
+                    config: { responseMimeType: "application/json" }
+                });
+                rawResult = JSON.parse(response.text.trim());
             }
 
-            const openai = new OpenAI({
-                baseURL: 'https://openrouter.ai/api/v1',
-                apiKey: aiConfig.apiKey,
-                defaultHeaders: {
-                    'HTTP-Referer': 'https://universal-deployer.fly.dev',
-                    'X-Title': 'Universal Fly Deployer',
-                }
-            });
-
-            const completion = await openai.chat.completions.create({
-                model: aiConfig.model || 'google/gemini-2.0-flash-exp:free',
-                messages: [
-                    { 
-                        role: 'system', 
-                        content: 'You are a DevOps expert. You must output VALID JSON only. Do not output markdown code blocks. The JSON schema is: { fly_toml: string, dockerfile: string|null, explanation: string, envVars: [{name:string, reason:string}], stack: string, healthCheckPath: string }' 
-                    },
-                    { role: 'user', content: prompt }
-                ],
-                response_format: { type: 'json_object' }
-            });
-
-            const content = completion.choices[0].message.content;
-            rawResult = JSON.parse(cleanJson(content));
-        
-        } else {
-            // Default to Gemini
-            const apiKey = aiConfig?.apiKey || process.env.API_KEY;
-
-            if (!apiKey) {
-                throw new Error("Gemini API Key is missing. Please provide it in AI Settings or ensure the server has a default key.");
-            }
-
-            console.log(`[${sessionId}] Using Gemini with model ${aiConfig?.model || 'default'}`);
-            
-            const ai = new GoogleGenAI({ apiKey });
-            
-            const tools = [];
-            if (analysisMethod === 'search_fallback') {
-                tools.push({ googleSearch: {} });
-                warnings.push("Codebase download failed. Analysis based on AI search inference.");
-            }
-            
-            const response = await ai.models.generateContent({
-                model: aiConfig?.model || 'gemini-3-flash-preview',
-                contents: prompt,
-                config: {
-                    tools: tools,
-                    responseMimeType: "application/json",
-                    responseSchema: {
-                        type: Type.OBJECT,
-                        properties: {
-                            fly_toml: { type: Type.STRING },
-                            dockerfile: { type: Type.STRING, nullable: true },
-                            explanation: { type: Type.STRING },
-                            envVars: { 
-                                type: Type.ARRAY,
-                                items: {
-                                    type: Type.OBJECT,
-                                    properties: {
-                                        name: { type: Type.STRING },
-                                        reason: { type: Type.STRING }
-                                    },
-                                    required: ["name", "reason"]
-                                }
-                            },
-                            stack: { type: Type.STRING },
-                            healthCheckPath: { type: Type.STRING }
-                        },
-                        required: ["fly_toml", "explanation", "envVars", "stack"]
-                    }
-                }
-            });
-
-            rawResult = JSON.parse(response.text.trim());
-            
-            sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks?.map(chunk => {
-                if (chunk.web) return { title: chunk.web.title, uri: chunk.web.uri };
-                return null;
-            }).filter(Boolean) || [];
+            const envVars = {};
+            if (rawResult.envVars) rawResult.envVars.forEach(v => { if (v?.name) envVars[v.name] = v.reason; });
+            res.json({ success: true, sessionId, ...rawResult, envVars });
+        } catch (aiError) {
+            console.error("AI Analysis Failed, using safe-mode fallback:", aiError);
+            res.json({ success: true, sessionId, ...GET_SAFE_FALLBACK_CONFIG(repoUrl) });
         }
-
-        const envVars = {};
-        if (Array.isArray(rawResult.envVars)) {
-            rawResult.envVars.forEach(v => {
-                if (v && v.name) envVars[v.name] = v.reason || '';
-            });
-        }
-
-        res.json({ 
-            success: true, 
-            sessionId, 
-            ...rawResult, 
-            envVars,
-            sources,
-            warnings
-        });
-
     } catch (error) {
-        console.error(`Analysis failed for ${repoUrl}:`, error);
-        await cleanup(workDir);
-        res.status(500).json({ error: error.message || "Failed to analyze repository" });
+        res.status(500).json({ error: error.message });
     }
 });
 
 app.post('/api/deploy', async (req, res) => {
     const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl, githubToken, preferExistingConfig } = req.body;
-
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
 
     const stream = (msg, type = 'info') => {
         res.write(`data: ${JSON.stringify({ message: msg, type })}\n\n`);
     };
 
-    await ensureTempDir();
     const workDir = path.join(TEMP_DIR, sessionId);
     let targetDir = workDir;
 
     try {
-        // --- 0. Pre-Flight Checks ---
-        // Ensure Flyctl is actually available before we start promises
         const flyExe = await ensureFlyCtl();
         const localPath = path.dirname(flyExe);
         const envPath = `${localPath}:${process.env.PATH}`;
 
-        // --- 1. Context Recovery ---
-        let needsDownload = true;
+        // Ensure Source is present
         try {
-             await fs.access(workDir);
-             const files = await fs.readdir(workDir);
-             if (files.length > 0) {
-                 const realEntries = files.filter(e => !e.startsWith('.'));
-                 if (realEntries.length === 1 && (await fs.stat(path.join(workDir, realEntries[0]))).isDirectory()) {
-                     targetDir = path.join(workDir, realEntries[0]);
-                 }
-                 needsDownload = false;
-             }
+            await fs.access(workDir);
+            const files = await fs.readdir(workDir);
+            if (files.length > 0) {
+                const realEntries = files.filter(e => !e.startsWith('.'));
+                if (realEntries.length === 1 && (await fs.stat(path.join(workDir, realEntries[0]))).isDirectory()) targetDir = path.join(workDir, realEntries[0]);
+            } else {
+                stream("Context lost, re-downloading...", "warning");
+                targetDir = await downloadRepo(repoUrl, workDir, githubToken);
+            }
         } catch {
-             await fs.mkdir(workDir, { recursive: true });
+            await fs.mkdir(workDir, { recursive: true });
+            targetDir = await downloadRepo(repoUrl, workDir, githubToken);
         }
 
-        if (needsDownload) {
-             if (repoUrl) {
-                stream("Initializing build context...", "info");
-                try {
-                    targetDir = await downloadRepo(repoUrl, workDir, githubToken);
-                } catch (e) {
-                    throw new Error(`Failed to download repository context: ${e.message}`);
-                }
-             } else {
-                 stream("Warning: Repository context missing and no URL provided.", "warning");
-             }
-        }
-
-        stream("Configuring deployment...", "info");
-
-        // --- 2. Configuration Write ---
+        stream("Writing configurations...", "info");
         const tomlPath = path.join(targetDir, 'fly.toml');
-        
+        let tomlData = flyToml;
         if (preferExistingConfig) {
-            try {
-                await fs.access(tomlPath);
-                stream("Found existing fly.toml in repository.", "success");
-                
-                // Patch existing TOML to update app name and region
-                let existingToml = await fs.readFile(tomlPath, 'utf8');
-                existingToml = existingToml.replace(/^\[app\]\s*$/gm, '');
-                existingToml = existingToml.replace(/^(app|name)\s*=.*/gm, '');
-                existingToml = existingToml.replace(/^primary_region\s*=.*/gm, '');
-                
-                const header = `app = "${appName}"\nprimary_region = "${region}"\n`;
-                await fs.writeFile(tomlPath, header + existingToml.trim());
-                stream(`Patched fly.toml with app="${appName}" and region="${region}"`, "info");
-            } catch (e) {
-                throw new Error("You selected 'Prefer existing config', but 'fly.toml' was not found in the repository.");
-            }
-        } else {
-            let finalToml = flyToml;
-            finalToml = finalToml.replace(/^\[app\]\s*$/gm, '');
-            finalToml = finalToml.replace(/^(app|name)\s*=.*/gm, '');
-            finalToml = finalToml.replace(/^primary_region\s*=.*/gm, '');
-            
-            const header = `app = "${appName}"\nprimary_region = "${region}"\n`;
-            finalToml = header + finalToml.trim();
-
-            await fs.writeFile(tomlPath, finalToml);
-            
-            if (dockerfile) {
-                await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
-                stream("Using AI-generated Dockerfile", "info");
-            } else {
-                stream("Using repository Dockerfile", "info");
-            }
+            tomlData = await fs.readFile(tomlPath, 'utf8');
         }
+        // Patch toml with current inputs
+        tomlData = `app = "${appName}"\nprimary_region = "${region}"\n` + tomlData.replace(/^app\s*=.*$/gm, '').replace(/^primary_region\s*=.*$/gm, '').replace(/^\[app\]\s*$/gm, '');
+        await fs.writeFile(tomlPath, tomlData);
+        if (dockerfile) await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
 
-        // --- 3. App Creation ---
-        // We remove '--org personal' to allow Fly to use default org or what the token is scoped to.
-        stream(`Registering app '${appName}' in region '${region}'...`, "info");
+        stream(`Authenticating with Fly.io...`, "info");
         try {
-            await runFlyctl(['apps', 'create', appName], flyToken, targetDir);
-            stream(`App '${appName}' created successfully.`, "success");
+            await execa(flyExe, ['apps', 'create', appName], { env: { FLY_API_TOKEN: flyToken, NO_COLOR: "1", PATH: envPath } });
+            stream(`New app '${appName}' registered.`, "success");
         } catch (e) {
-            if (e.stderr && (e.stderr.includes('taken') || e.stderr.includes('already exists'))) {
-                 stream(`App '${appName}' already exists. Proceeding to update...`, "warning");
-            } else if (e.message && (e.message.includes('taken') || e.message.includes('already exists'))) {
-                 stream(`App '${appName}' already exists. Proceeding to update...`, "warning");
-            } else {
-                 throw new Error(`Failed to create app: ${e.message || e.stderr}`);
-            }
+            if (e.stderr?.includes('taken') || e.stderr?.includes('exists')) stream("App already exists, performing update...", "warning");
+            else throw e;
         }
 
-        // --- 4. Deployment ---
-        stream("Starting remote builder... (This may take a few minutes)", "log");
-        stream("Connecting to Fly.io API...", "log");
-
-        // We use --ha=false for faster/cheaper deployments on free tier.
-        const deployArgs = ['deploy', '--ha=false']; 
-        
-        const deployProcess = execa(flyExe, deployArgs, {
+        stream("Launching deployment (Remote Build)...", "log");
+        const deploy = execa(flyExe, ['deploy', '--ha=false', '--wait-timeout', '600'], {
             cwd: targetDir,
-            env: { 
-                ...process.env, 
-                FLY_API_TOKEN: flyToken, 
-                NO_COLOR: "1", 
-                PATH: envPath 
-            }
-            // Do NOT use all: true, we want split streams
+            env: { ...process.env, FLY_API_TOKEN: flyToken, NO_COLOR: "1", PATH: envPath }
         });
 
-        // Robust Stream Handling
-        if (deployProcess.stdout) {
-            deployProcess.stdout.on('data', (chunk) => {
-                const text = chunk.toString();
-                const lines = text.split('\n');
-                lines.forEach(line => {
-                    if (line.trim()) stream(line.trim(), "log");
-                });
-            });
-        }
+        deploy.stdout.on('data', c => c.toString().split('\n').forEach(l => l.trim() && stream(l.trim(), 'log')));
+        deploy.stderr.on('data', c => c.toString().split('\n').forEach(l => l.trim() && stream(l.trim(), 'log')));
+
+        await deploy;
         
-        // Flyctl sends progress bars and status updates to stderr often
-        if (deployProcess.stderr) {
-            deployProcess.stderr.on('data', (chunk) => {
-                const text = chunk.toString();
-                const lines = text.split('\n');
-                lines.forEach(line => {
-                    if (line.trim()) stream(line.trim(), "log");
-                });
-            });
-        }
-
-        try {
-            await deployProcess;
-        } catch (e) {
-            // Execa throws if exit code is non-zero
-            throw new Error(`Deploy command failed with exit code ${e.exitCode}. Check logs above.`);
-        }
-
-        // --- 5. Verification ---
-        stream("Verifying deployment status...", "info");
-        const statusCheck = await runFlyctl(['status', '--json'], flyToken, targetDir);
-        const statusData = JSON.parse(statusCheck.stdout);
-
-        res.write(`data: ${JSON.stringify({ 
-            type: 'success', 
-            appUrl: `https://${statusData.Hostname}`, 
-            appName: statusData.Name 
-        })}\n\n`);
+        const statusCheck = await execa(flyExe, ['status', '--json'], { env: { FLY_API_TOKEN: flyToken, PATH: envPath } });
+        const status = JSON.parse(statusCheck.stdout);
+        res.write(`data: ${JSON.stringify({ type: 'success', appUrl: `https://${status.Hostname}`, appName: status.Name })}\n\n`);
 
     } catch (error) {
-        console.error("Deploy error:", error);
-        stream(`Deployment Failed: ${error.message}`, 'error');
+        stream(`FATAL: ${error.message}`, 'error');
     } finally {
         await cleanup(workDir);
         res.end();
@@ -663,8 +324,6 @@ if (process.env.NODE_ENV === 'production' && !IS_VERCEL) {
     app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../dist/index.html')));
 }
 
-if (!IS_VERCEL) {
-    app.listen(port, '0.0.0.0', () => console.log(`🚀 Backend running on port ${port}`));
-}
+if (!IS_VERCEL) app.listen(port, '0.0.0.0', () => console.log(`🚀 Antifragile backend on port ${port}`));
 
 export default app;

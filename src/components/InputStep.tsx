@@ -27,6 +27,21 @@ const generateAppNameFromUrl = (url: string) => {
 
 const BADGE_SVG_URL = "https://raw.githubusercontent.com/shapefuture/bolt.diy/main/flyio-button.svg";
 
+// Helper for robust health check
+const checkBackendHealth = async (retries = 3, delay = 1000): Promise<boolean> => {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const res = await fetch('/api/health');
+            if (res.ok) return true;
+        } catch (e) {
+            console.log(`Health check attempt ${i + 1} failed, retrying in ${delay}ms...`);
+        }
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 1.5; // Exponential backoff
+    }
+    return false;
+};
+
 export const InputStep = () => {
   const { repoUrl, flyToken, githubToken, preferExistingConfig, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setError, deployApp } = useDeployStore();
   const [isLoading, setIsLoading] = useState(false);
@@ -121,12 +136,10 @@ export const InputStep = () => {
 
     setIsLoading(true);
     try {
-      // Diagnostic Health Check
-      try {
-        const healthRes = await fetch('/api/health');
-        if (!healthRes.ok) throw new Error("Backend unhealthy");
-      } catch (e) {
-        throw new Error("Backend server is not reachable. Is the local server running on port 3000?");
+      // Diagnostic Health Check with Retry
+      const isHealthy = await checkBackendHealth(5, 500);
+      if (!isHealthy) {
+        throw new Error("Backend server is not reachable after multiple attempts. Please check if the local server is running.");
       }
 
       const res = await fetch('/api/analyze', {
