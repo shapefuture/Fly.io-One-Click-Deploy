@@ -677,6 +677,26 @@ app.post('/api/deploy', async (req, res) => {
             }
         }
 
+        // --- JUST-IN-TIME HEALER (ANTIFRAGILE LOGIC) ---
+        // If the frontend dropped the 'files' payload (state bug) but the Dockerfile needs config.yaml,
+        // we detect it here and regenerate it to prevent the build from crashing.
+        if (dockerfile && dockerfile.includes('COPY config.yaml')) {
+             const configPath = path.join(targetDir, 'config.yaml');
+             const hasConfig = existsSync(configPath);
+             
+             if (!hasConfig) {
+                 stream("⚠️  Healer: Missing config.yaml detected. Regenerating...", "warning");
+                 // Minimal viable config for Sniproxy to prevent build fail
+                 const emergencyConfig = `general:
+  bind_http: "0.0.0.0:80"
+  bind_https: "0.0.0.0:443"
+  public_ipv4: "127.0.0.1"
+  log_level: info`;
+                 await fs.writeFile(configPath, emergencyConfig);
+                 stream("✅ Healer: Emergency config.yaml injected.", "success");
+             }
+        }
+
         // --- CONTEXT SANITIZER PROTOCOL ---
         stream("🛡️ Sanitizing Build Context...", "info");
         const dockerIgnorePath = path.join(targetDir, '.dockerignore');

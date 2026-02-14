@@ -176,7 +176,8 @@ export const InputStep = () => {
         envVars: data.envVars || {},
         stack: data.stack || 'Unknown',
         healthCheckPath: data.healthCheckPath,
-        sources: data.sources || []
+        sources: data.sources || [],
+        files: data.files || [] // FIXED: Ensure files are passed to store
       });
 
       // SHORT CIRCUIT: Auto-deploy if using existing config
