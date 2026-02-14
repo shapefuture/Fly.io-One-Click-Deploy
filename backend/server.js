@@ -346,8 +346,47 @@ app.post('/api/analyze', async (req, res) => {
             return c.slice(0, 8000);
         })();
 
-        // STRICT PROMPT to avoid "checks" string error
-        const prompt = `DevOps Task: Config for Fly.io. Repo: ${repoUrl}. Context: ${context}. Return JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}. Syntax: Use [http_service] instead of [app]. IMPORTANT: Do NOT generate a top-level 'checks' property as a string. If you need checks, use [[services.checks]] or [http_service.checks].`;
+        // STRICT PROMPT: Enforcing the 'Combined' structure
+        const prompt = `DevOps Task: Config for Fly.io. Repo: ${repoUrl}. Context: ${context}. Return JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}.
+        
+        CRITICAL RULES for fly.toml:
+        1. Do NOT use a string for 'checks'. Example BAD: checks = "string".
+        2. Use explicit [[services]] definitions for ports.
+        3. Combine robust VM settings (auto_start/stop, shared cpu) with specific service checks.
+        
+        Preferred fly.toml Structure:
+        app = "app"
+        primary_region = "iad"
+
+        [build]
+        dockerfile = "Dockerfile"
+
+        [[vm]]
+        cpu_kind = "shared"
+        cpus = 1
+        memory_mb = 256
+
+        [[services]]
+        internal_port = 8080 # or detected port
+        protocol = "tcp"
+        auto_stop_machines = true
+        auto_start_machines = true
+        min_machines_running = 1
+        
+        [[services.ports]]
+            port = 80
+            handlers = ["http"]
+        [[services.ports]]
+            port = 443
+            handlers = ["tls", "http"]
+        
+        [[services.checks]]
+            type = "http"
+            path = "/"
+            interval = "10s"
+            timeout = "2s"
+            grace_period = "5s"
+        `;
 
         try {
             const provider = aiConfig?.provider || 'gemini';
@@ -380,9 +419,41 @@ app.post('/api/analyze', async (req, res) => {
             console.error("AI Error:", e);
             res.json({
                 success: true, sessionId,
-                fly_toml: 'app = "app"\nprimary_region = "iad"\n[http_service]\ninternal_port = 8080\nforce_https = true\nauto_stop_machines = true\nauto_start_machines = true\n[[vm]]\ncpu_kind = "shared"\ncpus = 1\nmemory_mb = 256',
+                // FALLBACK: The "Combined" config requested by user
+                fly_toml: `app = "app"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 1
+  
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+    
+  [[services.checks]]
+    type = "http"
+    path = "/"
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+`,
                 dockerfile: 'FROM node:18-alpine\nWORKDIR /app\nCOPY . .\nRUN npm ci\nCMD ["npm", "start"]',
-                explanation: "Fallback config due to AI error.",
+                explanation: "Fallback config used (Combined Format).",
                 envVars: {PORT: "8080"}, stack: "Fallback"
             });
         }

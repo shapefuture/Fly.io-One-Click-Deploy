@@ -21,6 +21,18 @@ export const ConfigStep = () => {
     document.body.removeChild(link);
   };
 
+  const downloadDockerfile = () => {
+    if (!generatedConfig?.dockerfile) return;
+    const blob = new Blob([generatedConfig.dockerfile], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'Dockerfile';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   if (!generatedConfig) return null;
 
   return (
@@ -139,9 +151,16 @@ export const ConfigStep = () => {
                     <div className="flex items-center gap-2 text-sm text-slate-300 font-mono">
                         <Globe className="w-4 h-4 text-green-400" /> Dockerfile
                     </div>
-                    <span className="text-[10px] text-slate-600 font-mono uppercase">
-                        {generatedConfig.dockerfile ? "AI Generated" : "Detected in Repository"}
-                    </span>
+                     <div className="flex items-center gap-2">
+                         {generatedConfig.dockerfile && (
+                             <button onClick={downloadDockerfile} className="text-[10px] text-slate-400 hover:text-white flex items-center gap-1 uppercase tracking-wide px-2 py-1 rounded hover:bg-white/5 transition-colors">
+                                <Download className="w-3 h-3" /> Download
+                             </button>
+                         )}
+                        <span className="text-[10px] text-slate-600 font-mono uppercase">
+                            {generatedConfig.dockerfile ? "AI Generated" : "Detected in Repository"}
+                        </span>
+                    </div>
                 </div>
                 {generatedConfig.dockerfile ? (
                      <div className="relative flex-1">
