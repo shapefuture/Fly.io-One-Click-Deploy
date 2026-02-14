@@ -451,11 +451,18 @@ app.post('/api/analyze', async (req, res) => {
                 };
 
                 // 3. Inject [env] into fly.toml SAFELY (Fix for duplicate table error)
-                const envContent = Object.entries(safetyVars)
-                    .map(([k, v]) => `  ${k} = '${v}'`)
-                    .join('\n');
-
                 if (json.fly_toml) {
+                     // FIRST: Remove any existing keys to prevent duplicates
+                     Object.keys(safetyVars).forEach(key => {
+                         // Regex matches "KEY = 'VAL'" or "KEY="VAL"" at start of line
+                         const regex = new RegExp(`^\\s*${key}\\s*=.*$`, 'gm');
+                         json.fly_toml = json.fly_toml.replace(regex, '');
+                     });
+
+                     const envContent = Object.entries(safetyVars)
+                        .map(([k, v]) => `  ${k} = '${v}'`)
+                        .join('\n');
+
                     // Check for existing [env] block using multiline regex
                     if (/^\s*\[env\]/m.test(json.fly_toml)) {
                         // If exists, insert our vars immediately after the header
@@ -466,7 +473,18 @@ app.post('/api/analyze', async (req, res) => {
                     }
                 }
 
-                // 4. Generate a Hardcoded config.yaml that bypasses the public IP check
+                // 4. Update UI Env Vars for visibility
+                if (!json.envVars) json.envVars = [];
+                // Ensure we are working with an array
+                const varsArr = Array.isArray(json.envVars) ? json.envVars : [];
+                Object.entries(safetyVars).forEach(([k, v]) => {
+                    if (!varsArr.find(e => e.name === k)) {
+                        varsArr.push({ name: k, reason: "Safety Net: Crash Prevention" });
+                    }
+                });
+                json.envVars = varsArr;
+
+                // 5. Generate a Hardcoded config.yaml that bypasses the public IP check
                 const sniproxyConfig = `
 public_ipv4: "127.0.0.1"
 public_ipv6: "::1"
@@ -477,7 +495,7 @@ upstream_dns: "1.1.1.1"
                 // Add this to a files array to be written in deploy step
                 json.files = [{ name: "config.yaml", content: sniproxyConfig }];
 
-                // 5. OVERRIDE DOCKERFILE with a robust Alpine version that copies the config
+                // 6. OVERRIDE DOCKERFILE with a robust Alpine version that copies the config
                 // This ignores the existing Dockerfile to ensure we can inject the config file.
                 json.dockerfile = `FROM golang:alpine AS builder
 WORKDIR /app
@@ -493,7 +511,7 @@ COPY config.yaml /config.yaml
 ENTRYPOINT ["/sniproxy", "-c", "/config.yaml"]
 `;
                 
-                // 6. Update explanation
+                // 7. Update explanation
                 json.explanation = (json.explanation || "") + " [System] Applied Max Fallback: Replaced Dockerfile to inject 'config.yaml', merged [env] variables, and force-bypass Public IP checks.";
             }
 
