@@ -7,7 +7,6 @@ FROM node:20-slim AS builder
 WORKDIR /app
 
 # Install dependencies for building
-# We copy both package files to ensure we catch lockfile consistency
 COPY package.json package-lock.json* ./
 RUN npm ci
 
@@ -42,7 +41,6 @@ ENV PATH="$FLYCTL_INSTALL/bin:$PATH"
 RUN flyctl version && git --version
 
 # Copy built frontend assets from the builder stage
-# The backend serves these static files
 COPY --from=builder /app/dist ./dist
 
 # Copy backend source code
@@ -52,7 +50,6 @@ COPY backend ./backend
 COPY package.json package-lock.json* ./
 
 # Install production dependencies only
-# We use 'npm ci --omit=dev' to exclude build tools like Vite/TypeScript to keep the image small
 RUN npm ci --omit=dev
 
 # Environment Configuration

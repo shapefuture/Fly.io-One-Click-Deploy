@@ -7,7 +7,7 @@ app = "universal-fly-deployer" # Note: You will likely need to change this to a 
 primary_region = "iad"
 
 [build]
-  dockerfile = "Dockerfile.txt"
+  dockerfile = "Dockerfile"
 
 [http_service]
   internal_port = 3000
@@ -20,4 +20,4 @@ primary_region = "iad"
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
-  memory_mb = 1024 # Allocated 1GB RAM to handle git cloning and analysis smoothly
+  memory_mb = 256 # Allocated 1GB RAM to handle git cloning and analysis smoothly
