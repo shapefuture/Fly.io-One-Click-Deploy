@@ -15,6 +15,7 @@ import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
 const AdmZip = require('adm-zip');
+const tar = require('tar');
 
 dotenv.config();
 
@@ -47,6 +48,7 @@ async function ensureTempDir() {
 }
 
 // Just-In-Time Installer for Flyctl on Serverless
+// Replaced shell script with pure Node.js implementation to avoid 'tar not found' issues
 async function ensureFlyCtl() {
     // 1. Check if global flyctl exists (Development / Docker)
     try {
@@ -66,29 +68,50 @@ async function ensureFlyCtl() {
 
     console.log("Installing flyctl to", FLY_INSTALL_DIR);
     try {
-        // Download install script
-        const installScriptPath = path.join(BASE_WORK_DIR, 'install-fly.sh');
+        const platform = os.platform();
+        const arch = os.arch();
         
-        // We use fetch (Node 18+) to get the script
-        const response = await fetch('https://fly.io/install.sh');
-        if (!response.ok) throw new Error('Failed to download fly install script');
+        let osName = 'Linux';
+        if (platform === 'darwin') osName = 'macOS';
+        else if (platform === 'win32') osName = 'Windows';
         
-        await fs.writeFile(installScriptPath, await response.text());
-        await fs.chmod(installScriptPath, 0o755);
-
-        // Run install script with custom install path
-        // Force sh execution and piping
-        await execa('sh', [installScriptPath], {
-            env: { ...process.env, FLYCTL_INSTALL: FLY_INSTALL_DIR }
+        let archName = 'x86_64';
+        if (arch === 'arm64') archName = 'arm64';
+        
+        // Get latest release version
+        console.log("Fetching latest flyctl version...");
+        const releaseRes = await fetch('https://api.github.com/repos/superfly/flyctl/releases/latest');
+        if (!releaseRes.ok) throw new Error("Failed to fetch latest flyctl release info");
+        const releaseData = await releaseRes.json();
+        const version = releaseData.tag_name.replace(/^v/, '');
+        
+        const assetName = `flyctl_${version}_${osName}_${archName}.tar.gz`;
+        const downloadUrl = `https://github.com/superfly/flyctl/releases/download/v${version}/${assetName}`;
+        
+        console.log(`Downloading ${downloadUrl}...`);
+        const response = await fetch(downloadUrl);
+        if (!response.ok) throw new Error(`Failed to download flyctl binary: ${response.statusText}`);
+        
+        const tgzPath = path.join(BASE_WORK_DIR, `flyctl-${version}.tar.gz`);
+        const buffer = Buffer.from(await response.arrayBuffer());
+        await fs.writeFile(tgzPath, buffer);
+        
+        // Ensure bin dir exists
+        const binDir = path.dirname(FLY_BIN);
+        await fs.mkdir(binDir, { recursive: true });
+        
+        // Extract
+        console.log("Extracting flyctl...");
+        await tar.x({
+            file: tgzPath,
+            cwd: binDir
         });
-
-        // Verify install
-        try {
-             await fs.access(FLY_BIN);
-        } catch (e) {
-             throw new Error(`Flyctl binary not found at ${FLY_BIN} after installation.`);
-        }
-
+        
+        await fs.unlink(tgzPath);
+        
+        // Verify
+        await fs.access(FLY_BIN);
+        
         return FLY_BIN;
     } catch (error) {
         console.error("Failed to install flyctl:", error);
