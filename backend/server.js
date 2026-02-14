@@ -327,7 +327,7 @@ app.post('/api/analyze', async (req, res) => {
             return res.json({
                 success: true, sessionId,
                 fly_toml: "# Existing config", dockerfile: null,
-                explanation: "Using existing config", envVars: {}, stack: "Existing"
+                explanation: "Using existing config", envVars: {}, stack: "Existing", files: []
             });
         }
 
@@ -426,73 +426,52 @@ app.post('/api/analyze', async (req, res) => {
             }
 
             // --- SAFETY NET FOR SNIPROXY (MAX FALLBACK) ---
-            // Even if AI misses it, we enforce these fixes for known hard cases
+            // If Sniproxy is detected, we FORCE a specific Dockerfile and Config to guarantee startup.
             if (repoUrl.toLowerCase().includes('sniproxy')) {
                 console.log("🛡️ Applying Sniproxy Max Fallback Safety Net");
                 
-                // 1. Force TCP Checks (HTTP checks kill TCP proxies)
-                // We basically rewrite the checks to be TCP-only
+                // 1. Force TCP Checks in fly.toml
                 if (json.fly_toml) {
                     json.fly_toml = json.fly_toml.replace(/type = 'http'/g, "type = 'tcp'");
-                    // Remove HTTP specific fields if checking TCP
                     json.fly_toml = json.fly_toml.replace(/path = '.*'/g, "# path removed for tcp check");
                     json.fly_toml = json.fly_toml.replace(/handlers = \['http'\]/g, "handlers = []");
                 }
 
-                // 2. Define Critical Env Vars (Crash Prevention)
-                const safetyVars = {
-                    "PUBLIC_IPV4": "127.0.0.1",
-                    "PUBLIC_IPV6": "::1",
-                    "SNIPROXY_PUBLIC_IPV4": "127.0.0.1",
-                    "SNIPROXY_PUBLIC_IPV6": "::1",
-                    "BIND_HTTP": "0.0.0.0:80",
-                    "BIND_HTTPS": "0.0.0.0:443",
-                    "SNIPROXY_BIND_HTTP": "0.0.0.0:80",
-                    "SNIPROXY_BIND_HTTPS": "0.0.0.0:443",
-                    "GOMAXPROCS": "1"
-                };
+                // 2. Generate a Hardcoded config.yaml that bypasses the public IP check
+                const sniproxyConfig = `
+public_ipv4: "127.0.0.1"
+public_ipv6: "::1"
+bind_http: "0.0.0.0:80"
+bind_https: "0.0.0.0:443"
+upstream_dns: "1.1.1.1"
+`;
+                // Add this to a files array to be written in deploy step
+                json.files = [{ name: "config.yaml", content: sniproxyConfig }];
 
-                // 3. Update JSON Env Vars for UI display
-                json.envVars = json.envVars || [];
-                const varsArr = Array.isArray(json.envVars) ? json.envVars : [];
+                // 3. OVERRIDE DOCKERFILE with a robust Alpine version that copies the config
+                // This ignores the existing Dockerfile to ensure we can inject the config file.
+                json.dockerfile = `FROM golang:alpine AS builder
+WORKDIR /app
+RUN apk add --no-cache git
+COPY . .
+WORKDIR /app/cmd/sniproxy
+RUN go build -ldflags "-s -w" -o /sniproxy .
+
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /sniproxy /sniproxy
+COPY config.yaml /config.yaml
+ENTRYPOINT ["/sniproxy", "-c", "/config.yaml"]
+`;
                 
-                Object.entries(safetyVars).forEach(([k, v]) => {
-                    if(!varsArr.find(x => x.name === k)) {
-                        varsArr.push({name: k, reason: "Crash Prevention Safety Net"});
-                    }
-                });
-                json.envVars = varsArr;
-
-                // 4. PROGRAMMATICALLY INJECT [env] INTO FLY.TOML
-                // This ensures vars are actually deployed, not just shown in UI
-                let envInjection = "\n[env]\n";
-                Object.entries(safetyVars).forEach(([k, v]) => {
-                    envInjection += `  ${k} = '${v}'\n`;
-                });
-
-                if (json.fly_toml) {
-                    if (json.fly_toml.includes("[env]")) {
-                        // Append to existing [env] block using regex to find end of block or just append to file
-                        // Simplest robust method: Append to end of file, TOML parsers usually handle later keys overriding or merging
-                        // BUT standard is one section. Let's try to append to the end of the string, 
-                        // but if [env] exists, we might duplicate. 
-                        // Strategy: Remove existing [env] block if it exists (complex regex), then append our full one?
-                        // Better: Just append. Flyctl usually merges.
-                        json.fly_toml += envInjection;
-                    } else {
-                        json.fly_toml += envInjection;
-                    }
-                }
-                
-                // 5. Update explanation
-                json.explanation = (json.explanation || "") + " [System] Applied Critical Fixes: Enforced TCP checks, removed HTTP handlers, and injected 'PUBLIC_IP' overrides into [env] to prevent crash.";
+                // 4. Update explanation
+                json.explanation = (json.explanation || "") + " [System] Applied Max Fallback: Replaced Dockerfile to inject 'config.yaml' and force-bypass Public IP checks.";
             }
 
             const envVars = {};
             if (Array.isArray(json.envVars)) {
                 json.envVars.forEach(e => envVars[e.name] = e.reason);
             } else if (json.envVars) {
-                // Handle case where AI returns object instead of array
                 Object.entries(json.envVars).forEach(([k, v]) => envVars[k] = v);
             }
 
@@ -502,49 +481,35 @@ app.post('/api/analyze', async (req, res) => {
             console.error("AI Error:", e);
             res.json({
                 success: true, sessionId,
-                // FALLBACK with SINGLE QUOTES and DUAL MEMORY settings
                 fly_toml: `app = 'app'
 primary_region = 'iad'
-
 [build]
   dockerfile = 'Dockerfile'
-
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
   memory_mb = 256
-
 [[services]]
-  internal_port = 443 # Sniproxy usually listens on 443/80
+  internal_port = 443 
   protocol = 'tcp'
   auto_stop_machines = true
   auto_start_machines = true
   min_machines_running = 1
-  
   [[services.ports]]
     port = 80
     handlers = ['http']
   [[services.ports]]
     port = 443
     handlers = ['tls', 'http']
-
   [[services.checks]]
-    type = 'tcp' # Safe default for proxies
+    type = 'tcp'
     interval = '10s'
     timeout = '2s'
-    grace_period = '5s'
-
-[env]
-  PUBLIC_IPV4 = '127.0.0.1'
-  SNIPROXY_PUBLIC_IPV4 = '127.0.0.1'
-  PUBLIC_IPV6 = '::1'
-  SNIPROXY_PUBLIC_IPV6 = '::1'
-`,
-                // Don't overwrite if it exists
+    grace_period = '5s'`,
                 dockerfile: hasDockerfile ? null : 'FROM node:18-alpine\nWORKDIR /app\nCOPY . .\nRUN npm ci\nCMD ["npm", "start"]',
-                explanation: "Fallback config used. IMPORTANT: Check if your app requires PUBLIC_IP env var.",
-                envVars: {PORT: "8080", PUBLIC_IP: "127.0.0.1"}, stack: "Fallback"
+                explanation: "Fallback config used.",
+                envVars: {PORT: "8080"}, stack: "Fallback", files: []
             });
         }
     } catch (e) {
@@ -553,7 +518,7 @@ primary_region = 'iad'
 });
 
 app.post('/api/deploy', async (req, res) => {
-    const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl, githubToken, preferExistingConfig } = req.body;
+    const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl, githubToken, preferExistingConfig, files } = req.body;
     
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Connection', 'keep-alive');
@@ -601,7 +566,6 @@ app.post('/api/deploy', async (req, res) => {
              try { tomlContent = await fs.readFile(tomlPath, 'utf8'); } catch { throw new Error("Missing fly.toml"); }
         }
         
-        // Sanitize TOML: Force SINGLE QUOTES for app/region
         tomlContent = `app = '${appName}'\nprimary_region = '${region}'\n` + 
             tomlContent.replace(/^app\s*=.*$/gm, '')
                        .replace(/^primary_region\s*=.*$/gm, '')
@@ -610,10 +574,16 @@ app.post('/api/deploy', async (req, res) => {
             
         await fs.writeFile(tomlPath, tomlContent);
         
-        // CRITICAL: Only write Dockerfile if specifically provided AND NOT NULL
-        // This protects the 'scratch' dockerfile from being overwritten
         if (dockerfile && typeof dockerfile === 'string' && dockerfile.trim().length > 0) {
             await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
+        }
+
+        // Write Extra Files (Safety Net configs)
+        if (files && Array.isArray(files)) {
+            for (const f of files) {
+                await fs.writeFile(path.join(targetDir, f.name), f.content);
+                stream(`Generated ${f.name}`, 'info');
+            }
         }
 
         stream("Registering app...", "info");
@@ -651,7 +621,11 @@ app.post('/api/deploy', async (req, res) => {
 
         await proc;
 
-        const statusProc = await execa(flyExe, ['status', '--json'], { env: DEPLOY_ENV });
+        // FIXED: Added { cwd: targetDir } so flyctl finds the config and app name
+        const statusProc = await execa(flyExe, ['status', '--json'], { 
+            env: DEPLOY_ENV,
+            cwd: targetDir 
+        });
         const status = JSON.parse(statusProc.stdout);
         
         res.write(`data: ${JSON.stringify({ type: 'success', appUrl: `https://${status.Hostname}`, appName: status.Name })}\n\n`);
