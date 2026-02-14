@@ -8,6 +8,11 @@ export const PolicyEngine = {
      * This acts as a safety net for known configuration edge cases.
      */
     apply: async (targetDir, appName, region, stream) => {
+        if (!targetDir || !existsSync(targetDir)) {
+            console.warn(`[PolicyEngine] Skipping policy check: ${targetDir} does not exist.`);
+            return;
+        }
+
         try {
             // 1. Antifragile YAML DNS Patching
             const files = await fs.readdir(targetDir);

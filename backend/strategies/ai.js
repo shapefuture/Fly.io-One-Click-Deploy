@@ -1,7 +1,10 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { GoogleGenAI, Type } from "@google/genai";
-import OpenAI from 'openai';
+
+// DYNAMIC IMPORT STRATEGY: 
+// We do NOT import @google/genai or openai at the top level.
+// This prevents the entire backend server from crashing on startup if 
+// the AI packages are missing, have version mismatches, or if 'Type' is undefined.
 
 export const AIStrategy = {
     name: "AIStrategy",
@@ -68,6 +71,9 @@ export const AIStrategy = {
 
         try {
             if (provider === 'openrouter') {
+                // Dynamic import for OpenAI
+                const { default: OpenAI } = await import('openai');
+                
                 const openai = new OpenAI({ baseURL: 'https://openrouter.ai/api/v1', apiKey: aiConfig.apiKey });
                 const completion = await openai.chat.completions.create({
                     model: aiConfig.model || 'google/gemini-2.0-flash-exp:free',
@@ -78,6 +84,9 @@ export const AIStrategy = {
             } else {
                 const apiKey = aiConfig?.apiKey || process.env.API_KEY;
                 if (!apiKey) throw new Error("API Key missing");
+                
+                // Dynamic import for GoogleGenAI
+                const { GoogleGenAI, Type } = await import("@google/genai");
                 
                 const ai = new GoogleGenAI({ apiKey });
                 
@@ -130,7 +139,7 @@ export const AIStrategy = {
             }
         } catch (e) {
             console.error("AI Generation Error:", e);
-            throw new Error("AI Analysis Failed: " + e.message);
+            throw new Error(`AI Analysis Failed: ${e.message} (Check backend logs for details)`);
         }
 
         if (hasDockerfile) json.dockerfile = null;
