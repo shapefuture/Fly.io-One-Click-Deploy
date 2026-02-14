@@ -13,6 +13,8 @@ import { downloadRepo } from './lib/git.js';
 import { StackDetector } from './lib/stack-detector.js';
 import { PolicyEngine } from './lib/policy.js';
 
+console.log('🚀 Starting Backend Server...');
+
 dotenv.config();
 
 const app = express();
@@ -57,7 +59,7 @@ async function ensureDirs() {
 // Background install
 (async () => {
     await ensureDirs();
-    if (!IS_VERCEL) getFlyExe().catch(() => {});
+    if (!IS_VERCEL) getFlyExe().catch(e => console.error("Fly CLI Background Install Failed:", e.message));
 })();
 
 async function cleanup(dir) {
@@ -228,7 +230,9 @@ dist
 
         // --- POLICY ENGINE EXECUTION ---
         try {
-            await PolicyEngine.apply(targetDir, appName, region, stream);
+            if (PolicyEngine && PolicyEngine.apply) {
+                await PolicyEngine.apply(targetDir, appName, region, stream);
+            }
         } catch (e) {
             stream(`⚠️ Policy Engine check failed (Non-critical): ${e.message}`, 'warning');
         }

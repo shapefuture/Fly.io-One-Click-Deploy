@@ -9,14 +9,6 @@ import { createRequire } from 'module';
 import { IS_WINDOWS, IS_VERCEL, BIN_NAME, VERCEL_HOME, FLY_INSTALL_DIR, FLY_BIN } from './config.js';
 
 const require = createRequire(import.meta.url);
-const AdmZip = require('adm-zip');
-
-let tar;
-try {
-    tar = require('tar');
-} catch (e) {
-    console.warn("⚠️ Warning: 'tar' npm package is missing. Fallback to system tar will be used.");
-}
 
 let flyBinPath = null;
 let installationPromise = null;
@@ -25,6 +17,20 @@ let lastInstallError = null;
 async function performAntifragileInstallation() {
     const log = (msg) => console.log(`[FlyInstaller] ${msg}`);
     const warn = (msg) => console.warn(`[FlyInstaller] ${msg}`);
+
+    // Lazy load dependencies to ensure server starts even if they are missing
+    let AdmZip, tar;
+    try {
+        AdmZip = require('adm-zip');
+    } catch (e) {
+        throw new Error("Missing 'adm-zip'. Please run npm install.");
+    }
+    
+    try {
+        tar = require('tar');
+    } catch (e) {
+        warn("'tar' npm package missing. Will fall back to system tar.");
+    }
 
     const CHILD_ENV = {
         ...process.env,
