@@ -77,14 +77,22 @@ async function ensureFlyCtl() {
         await fs.chmod(installScriptPath, 0o755);
 
         // Run install script with custom install path
+        // Force sh execution and piping
         await execa('sh', [installScriptPath], {
             env: { ...process.env, FLYCTL_INSTALL: FLY_INSTALL_DIR }
         });
 
+        // Verify install
+        try {
+             await fs.access(FLY_BIN);
+        } catch (e) {
+             throw new Error(`Flyctl binary not found at ${FLY_BIN} after installation.`);
+        }
+
         return FLY_BIN;
     } catch (error) {
         console.error("Failed to install flyctl:", error);
-        throw new Error("Could not install flyctl runtime dependency");
+        throw new Error(`Could not install flyctl runtime dependency: ${error.message}`);
     }
 }
 
@@ -167,7 +175,10 @@ async function runFlyctl(args, token, cwd, env = {}) {
         return { success: true, stdout, stderr };
     } catch (error) {
         const errorMsg = error.stderr || error.stdout || error.message || 'Unknown flyctl error';
-        throw new Error(errorMsg);
+        // Attach stderr to error object for caller inspection
+        const err = new Error(errorMsg);
+        err.stderr = error.stderr;
+        throw err;
     }
 }
 
@@ -455,7 +466,13 @@ app.post('/api/deploy', async (req, res) => {
     let targetDir = workDir;
 
     try {
-        // Recover context or download fresh if analyzing was skipped or files missing
+        // --- 0. Pre-Flight Checks ---
+        // Ensure Flyctl is actually available before we start promises
+        const flyExe = await ensureFlyCtl();
+        const localPath = path.dirname(flyExe);
+        const envPath = `${localPath}:${process.env.PATH}`;
+
+        // --- 1. Context Recovery ---
         let needsDownload = true;
         try {
              await fs.access(workDir);
@@ -486,19 +503,16 @@ app.post('/api/deploy', async (req, res) => {
 
         stream("Configuring deployment...", "info");
 
-        // 1. Write Config Files
+        // --- 2. Configuration Write ---
         const tomlPath = path.join(targetDir, 'fly.toml');
         
         if (preferExistingConfig) {
             try {
-                // If user preferred existing config, we must find it here
                 await fs.access(tomlPath);
                 stream("Found existing fly.toml in repository.", "success");
                 
-                // We MUST patch the app name and region, otherwise flyctl won't know where to deploy the new app
+                // Patch existing TOML to update app name and region
                 let existingToml = await fs.readFile(tomlPath, 'utf8');
-                
-                // Strip existing headers to avoid conflict
                 existingToml = existingToml.replace(/^\[app\]\s*$/gm, '');
                 existingToml = existingToml.replace(/^(app|name)\s*=.*/gm, '');
                 existingToml = existingToml.replace(/^primary_region\s*=.*/gm, '');
@@ -510,7 +524,6 @@ app.post('/api/deploy', async (req, res) => {
                 throw new Error("You selected 'Prefer existing config', but 'fly.toml' was not found in the repository.");
             }
         } else {
-            // Standard Path: Write config from inputs
             let finalToml = flyToml;
             finalToml = finalToml.replace(/^\[app\]\s*$/gm, '');
             finalToml = finalToml.replace(/^(app|name)\s*=.*/gm, '');
@@ -529,27 +542,27 @@ app.post('/api/deploy', async (req, res) => {
             }
         }
 
-        // 2. Create/Check App
-        const flyExe = await ensureFlyCtl();
-        const localPath = path.dirname(flyExe);
-        const envPath = `${localPath}:${process.env.PATH}`;
-        
+        // --- 3. App Creation ---
+        // We remove '--org personal' to allow Fly to use default org or what the token is scoped to.
         stream(`Registering app '${appName}' in region '${region}'...`, "info");
         try {
-            await runFlyctl(['apps', 'create', appName, '--org', 'personal'], flyToken, targetDir);
+            await runFlyctl(['apps', 'create', appName], flyToken, targetDir);
             stream(`App '${appName}' created successfully.`, "success");
         } catch (e) {
-            if (e && e.message && e.message.includes('taken')) {
-                stream(`App '${appName}' already exists. Updating...`, "warning");
+            if (e.stderr && (e.stderr.includes('taken') || e.stderr.includes('already exists'))) {
+                 stream(`App '${appName}' already exists. Proceeding to update...`, "warning");
+            } else if (e.message && (e.message.includes('taken') || e.message.includes('already exists'))) {
+                 stream(`App '${appName}' already exists. Proceeding to update...`, "warning");
             } else {
-                throw e;
+                 throw new Error(`Failed to create app: ${e.message || e.stderr}`);
             }
         }
 
-        // 3. Deploy
-        stream("Starting remote builder...", "log");
-        stream("This may take a few minutes. Streaming logs...", "log");
+        // --- 4. Deployment ---
+        stream("Starting remote builder... (This may take a few minutes)", "log");
+        stream("Connecting to Fly.io API...", "log");
 
+        // We use --ha=false for faster/cheaper deployments on free tier.
         const deployArgs = ['deploy', '--ha=false']; 
         
         const deployProcess = execa(flyExe, deployArgs, {
@@ -559,21 +572,40 @@ app.post('/api/deploy', async (req, res) => {
                 FLY_API_TOKEN: flyToken, 
                 NO_COLOR: "1", 
                 PATH: envPath 
-            },
-            all: true
+            }
+            // Do NOT use all: true, we want split streams
         });
 
-        deployProcess.all.on('data', (chunk) => {
-            const lines = chunk.toString().split('\n');
-            lines.forEach(line => {
-                const trimmed = line.trim();
-                if (trimmed) stream(trimmed, "log");
+        // Robust Stream Handling
+        if (deployProcess.stdout) {
+            deployProcess.stdout.on('data', (chunk) => {
+                const text = chunk.toString();
+                const lines = text.split('\n');
+                lines.forEach(line => {
+                    if (line.trim()) stream(line.trim(), "log");
+                });
             });
-        });
+        }
+        
+        // Flyctl sends progress bars and status updates to stderr often
+        if (deployProcess.stderr) {
+            deployProcess.stderr.on('data', (chunk) => {
+                const text = chunk.toString();
+                const lines = text.split('\n');
+                lines.forEach(line => {
+                    if (line.trim()) stream(line.trim(), "log");
+                });
+            });
+        }
 
-        await deployProcess;
+        try {
+            await deployProcess;
+        } catch (e) {
+            // Execa throws if exit code is non-zero
+            throw new Error(`Deploy command failed with exit code ${e.exitCode}. Check logs above.`);
+        }
 
-        // 4. Verify
+        // --- 5. Verification ---
         stream("Verifying deployment status...", "info");
         const statusCheck = await runFlyctl(['status', '--json'], flyToken, targetDir);
         const statusData = JSON.parse(statusCheck.stdout);

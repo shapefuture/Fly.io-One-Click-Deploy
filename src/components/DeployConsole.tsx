@@ -13,16 +13,19 @@ export const DeployConsole = () => {
   }, [logs]);
 
   const getLogStyle = (log: { message: string, type: string }) => {
-    if (log.type === 'error') return 'text-red-400 bg-red-900/10 border-l-2 border-red-500 pl-2';
-    if (log.type === 'warning') return 'text-yellow-400 bg-yellow-900/10 border-l-2 border-yellow-500 pl-2';
-    if (log.type === 'success') return 'text-green-400 font-bold bg-green-900/10 border-l-2 border-green-500 pl-2 py-1';
+    if (log.type === 'error') return 'text-red-400 bg-red-900/10 border-l-2 border-red-500 pl-2 py-1 my-1';
+    if (log.type === 'warning') return 'text-yellow-400 bg-yellow-900/10 border-l-2 border-yellow-500 pl-2 py-1 my-1';
+    if (log.type === 'success') return 'text-green-400 font-bold bg-green-900/10 border-l-2 border-green-500 pl-2 py-1 my-1';
+    if (log.type === 'info') return 'text-blue-300 font-semibold mt-2 border-l-2 border-blue-500 pl-2';
     
     // Heuristic styling for raw flyctl logs
-    if (log.message.includes('Step')) return 'text-blue-300 font-bold mt-2';
-    if (log.message.match(/^\[.*\]/)) return 'text-slate-400'; // Timestamps or tags
-    if (log.message.includes('v0')) return 'text-slate-500'; // Release versions
+    const msg = log.message;
+    if (msg.includes('Step') || msg.match(/^\[\d+\/\d+\]/)) return 'text-cyan-300 font-bold mt-1'; // Build steps
+    if (msg.includes('Waiting for remote builder')) return 'text-purple-300 italic';
+    if (msg.match(/v\d+ deployed successfully/)) return 'text-green-400 font-bold';
+    if (msg.includes('Pushing image')) return 'text-slate-400';
     
-    return 'text-slate-300';
+    return 'text-slate-300 font-mono opacity-90';
   };
 
   return (
@@ -84,20 +87,23 @@ export const DeployConsole = () => {
         >
           {logs.map((log, i) => (
             <div key={i} className={`break-words transition-all duration-300 ${getLogStyle(log)}`}>
-              {log.type === 'log' && (
-                  <span className="inline-block w-2 h-2 mr-2 opacity-20">›</span>
+              {log.type === 'log' && !log.message.includes('Step') && (
+                  <span className="inline-block w-2 h-2 mr-2 opacity-20 select-none">›</span>
               )}
               {log.message}
             </div>
           ))}
           
           {currentStep === 'deploying' && (
-            <div className="animate-pulse text-blue-500 mt-2">_</div>
+            <div className="animate-pulse text-blue-500 mt-2 pl-4">_</div>
           )}
 
           {error && (
               <div className="mt-4 p-4 bg-red-500/10 border border-red-500/20 rounded text-red-300">
                   <strong>Critical Error:</strong> {error}
+                  <div className="mt-2 text-xs text-red-400/70">
+                      Common fixes: Check your Fly.io token permissions, ensure app name is unique, or verify credit card on file for remote builders.
+                  </div>
               </div>
           )}
         </div>
