@@ -1,0 +1,5 @@
+{
+  "name": "Universal Fly.io Deployer",
+  "description": "A full-stack AI-powered tool to deploy any GitHub repository to Fly.io effortlessly. Features intelligent config generation, real-time log streaming, and zero-config deployment orchestration.",
+  "requestFramePermissions": []
+}
