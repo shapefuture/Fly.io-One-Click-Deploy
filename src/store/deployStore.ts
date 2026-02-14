@@ -40,11 +40,13 @@ interface DeployState {
   setDeployedUrl: (url: string) => void;
   setError: (error: string) => void;
   reset: () => void;
+  
+  deployApp: () => Promise<void>;
 }
 
 export const useDeployStore = create<DeployState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       currentStep: 'input',
       repoUrl: '',
       flyToken: '',
@@ -80,7 +82,52 @@ export const useDeployStore = create<DeployState>()(
         logs: [],
         deployedUrl: null,
         error: null
-      })
+      }),
+
+      deployApp: async () => {
+        const { sessionId, flyToken, appName, region, repoUrl, githubToken, preferExistingConfig, generatedConfig } = get();
+        
+        set({ currentStep: 'deploying', error: null, logs: [], deployedUrl: null });
+
+        try {
+          const response = await fetch('/api/deploy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              sessionId, flyToken, appName, region, repoUrl, githubToken, preferExistingConfig,
+              flyToml: generatedConfig?.fly_toml,
+              dockerfile: generatedConfig?.dockerfile
+            })
+          });
+
+          const reader = response.body?.getReader();
+          const decoder = new TextDecoder();
+          if (!reader) throw new Error("Failed to stream logs");
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = decoder.decode(value);
+            const lines = chunk.split('\n\n');
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                try {
+                    const data = JSON.parse(line.slice(6));
+                    if (data.type === 'success') {
+                        set({ deployedUrl: data.appUrl, currentStep: 'success' });
+                        return;
+                    } else {
+                        get().addLog({ message: data.message, type: data.type });
+                    }
+                } catch (e) { console.error("Parse error on chunk", line); }
+              }
+            }
+          }
+        } catch (e: any) {
+            get().addLog({ message: `Fatal error: ${e.message}`, type: 'error' });
+            set({ error: e.message, currentStep: 'error' });
+        }
+      }
     }),
     {
       name: 'deploy-storage',

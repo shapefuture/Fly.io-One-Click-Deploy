@@ -28,7 +28,7 @@ const generateAppNameFromUrl = (url: string) => {
 const BADGE_SVG_URL = "https://raw.githubusercontent.com/shapefuture/bolt.diy/main/flyio-button.svg";
 
 export const InputStep = () => {
-  const { repoUrl, flyToken, githubToken, preferExistingConfig, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setError } = useDeployStore();
+  const { repoUrl, flyToken, githubToken, preferExistingConfig, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setError, deployApp } = useDeployStore();
   const [isLoading, setIsLoading] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [showAiSettings, setShowAiSettings] = useState(false);
@@ -144,12 +144,9 @@ export const InputStep = () => {
         })
       });
       
-      // Robust "RPC-style" error handling
-      // We check content-type before parsing to avoid the "Unexpected token T" error
       const contentType = res.headers.get("content-type");
       if (!contentType || !contentType.includes("application/json")) {
           const text = await res.text();
-          // Extract meaningful error from HTML if possible, otherwise truncate
           const preview = text.length > 200 ? text.substring(0, 200) + "..." : text;
           throw new Error(`Backend Error (${res.status}): ${preview}`);
       }
@@ -168,11 +165,19 @@ export const InputStep = () => {
         healthCheckPath: data.healthCheckPath,
         sources: data.sources || []
       });
-      setStep('config');
+
+      // SHORT CIRCUIT: Auto-deploy if using existing config
+      if (preferExistingConfig) {
+          // Trigger deployment immediately
+          await deployApp();
+          // State is handled inside deployApp (sets step to 'deploying')
+      } else {
+          setStep('config');
+      }
+
     } catch (err: any) {
       console.error("Analyze Error:", err);
-      // Clean up error message for UI
-      const msg = err.message.replace(/<[^>]*>/g, ''); // Strip HTML tags if any leaked
+      const msg = err.message.replace(/<[^>]*>/g, '');
       setError(msg || "Failed to analyze repository. The backend service might be unavailable.");
     } finally {
       setIsLoading(false);
@@ -300,8 +305,8 @@ export const InputStep = () => {
                                 onChange={(e) => setInputs({ preferExistingConfig: e.target.checked })}
                              />
                              <div className="flex-1">
-                                 <span className="block text-sm text-slate-300 font-medium group-hover:text-white transition-colors">Prefer existing config</span>
-                                 <span className="block text-xs text-slate-500 leading-tight">If a <code>fly.toml</code> exists, use it instead of generating a new one.</span>
+                                 <span className="block text-sm text-slate-300 font-medium group-hover:text-white transition-colors">Skip analysis & Deploy</span>
+                                 <span className="block text-xs text-slate-500 leading-tight">If a <code>fly.toml</code> exists, deploy immediately without AI analysis or review.</span>
                              </div>
                         </label>
                      </div>
@@ -443,11 +448,11 @@ export const InputStep = () => {
         {isLoading ? (
           <>
             <Loader2 className="w-5 h-5 animate-spin" />
-            Analyzing Repository...
+            {preferExistingConfig ? "Initializing Deployment..." : "Analyzing Repository..."}
           </>
         ) : (
           <>
-            Initialize Deployment
+            {preferExistingConfig ? "Deploy Immediately" : "Initialize Deployment"}
             <ArrowRight className="w-5 h-5" />
           </>
         )}

@@ -253,6 +253,25 @@ app.post('/api/analyze', async (req, res) => {
         let configContent = "";
         let analysisMethod = "local";
 
+        // --- SHORT CIRCUIT: Trust User ---
+        // If user says "Prefer Existing Config", we skip analysis entirely.
+        // We do not download the repo here to save time and bandwidth.
+        if (preferExistingConfig) {
+            console.log(`[${sessionId}] Prefer existing config enabled. Skipping download and AI analysis.`);
+            return res.json({
+                success: true,
+                sessionId,
+                fly_toml: "# Using existing configuration from repository",
+                dockerfile: null,
+                explanation: "Skipping analysis. Deployment will use the 'fly.toml' and 'Dockerfile' found in the repository directly.",
+                envVars: {},
+                stack: "Repository Config",
+                healthCheckPath: "",
+                sources: [],
+                warnings: ["Analysis skipped. Using repository configuration."]
+            });
+        }
+
         try {
             // Try downloading repo
             const repoDir = await downloadRepo(repoUrl, workDir, githubToken);
@@ -261,9 +280,6 @@ app.post('/api/analyze', async (req, res) => {
         } catch (e) {
             console.warn(`[${sessionId}] Repo download failed: ${e.message}. Falling back to AI Search.`);
             analysisMethod = "search_fallback";
-            
-            // If download failed but we don't have search enabled (Gemini only), we might be stuck.
-            // But we will proceed and hope Gemini can infer from URL or search tool.
         }
 
         const prompt = `
@@ -273,7 +289,6 @@ app.post('/api/analyze', async (req, res) => {
         - The user wants to deploy this application to Fly.io.
         - Repository URL: ${repoUrl}
         - Analysis Method: ${analysisMethod === 'local' ? 'Codebase Analysis' : 'Search & Inference (Codebase unavailable)'}
-        ${preferExistingConfig ? "- PREFERENCE: The user prefers to use the existing 'fly.toml' if one is found in the configuration files. Only modify it if strictly necessary for deployment to work." : ""}
 
         Repository File Structure (truncated):
         ${fileStructure.slice(0, 100).join('\n')}
@@ -297,7 +312,6 @@ app.post('/api/analyze', async (req, res) => {
            - Set 'auto_stop_machines = true' and 'auto_start_machines = true'.
            - **COST EFFICIENCY**: Include a [[vm]] block with 'cpu_kind = "shared"', 'cpus = 1', and 'memory_mb = 256' to target the free/hobby tier.
            - Add a [checks] block for health monitoring if a health endpoint (/health, /up, /) is likely.
-           - IF 'fly.toml' exists in Config Content and user preference is set, REUSE IT unless broken.
         4. **Dockerfile Generation**:
            - **Crucial**: If a 'Dockerfile' already exists in the provided config content, set the 'dockerfile' field in JSON to null. We prefer the user's Dockerfile.
            - If NO Dockerfile exists, generate a **production-grade Multi-Stage** Dockerfile.
@@ -357,8 +371,6 @@ app.post('/api/analyze', async (req, res) => {
             
             const ai = new GoogleGenAI({ apiKey });
             
-            // Only use tools if strictly necessary (e.g. search fallback)
-            // AND we are strictly using Gemini (checked by else block).
             const tools = [];
             if (analysisMethod === 'search_fallback') {
                 tools.push({ googleSearch: {} });
@@ -404,7 +416,6 @@ app.post('/api/analyze', async (req, res) => {
             }).filter(Boolean) || [];
         }
 
-        // Transform envVars to object for frontend
         const envVars = {};
         if (Array.isArray(rawResult.envVars)) {
             rawResult.envVars.forEach(v => {
@@ -429,7 +440,7 @@ app.post('/api/analyze', async (req, res) => {
 });
 
 app.post('/api/deploy', async (req, res) => {
-    const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl, githubToken } = req.body;
+    const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl, githubToken, preferExistingConfig } = req.body;
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -444,14 +455,12 @@ app.post('/api/deploy', async (req, res) => {
     let targetDir = workDir;
 
     try {
-        // Recover context if on serverless (files might be gone if new instance)
-        // Check if directory exists and has files
+        // Recover context or download fresh if analyzing was skipped or files missing
         let needsDownload = true;
         try {
              await fs.access(workDir);
              const files = await fs.readdir(workDir);
              if (files.length > 0) {
-                 // Check if it's the root or if we need to find subdir
                  const realEntries = files.filter(e => !e.startsWith('.'));
                  if (realEntries.length === 1 && (await fs.stat(path.join(workDir, realEntries[0]))).isDirectory()) {
                      targetDir = path.join(workDir, realEntries[0]);
@@ -471,39 +480,57 @@ app.post('/api/deploy', async (req, res) => {
                     throw new Error(`Failed to download repository context: ${e.message}`);
                 }
              } else {
-                 stream("Warning: Repository context missing and no URL provided. Deployment may fail if build requires source.", "warning");
+                 stream("Warning: Repository context missing and no URL provided.", "warning");
              }
         }
 
-        stream("Writing configuration...", "info");
+        stream("Configuring deployment...", "info");
 
         // 1. Write Config Files
         const tomlPath = path.join(targetDir, 'fly.toml');
         
-        let finalToml = flyToml;
-        
-        // Remove [app] block header if present
-        finalToml = finalToml.replace(/^\[app\]\s*$/gm, '');
-        // Remove existing app/name/region definitions (top level or inside table)
-        finalToml = finalToml.replace(/^(app|name)\s*=.*/gm, '');
-        finalToml = finalToml.replace(/^primary_region\s*=.*/gm, '');
-        
-        // Prepare new header
-        const header = `app = "${appName}"\nprimary_region = "${region}"\n`;
-        finalToml = header + finalToml.trim();
-
-        await fs.writeFile(tomlPath, finalToml);
-        if (dockerfile) {
-            await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
-            stream("Using AI-generated Dockerfile", "info");
+        if (preferExistingConfig) {
+            try {
+                // If user preferred existing config, we must find it here
+                await fs.access(tomlPath);
+                stream("Found existing fly.toml in repository.", "success");
+                
+                // We MUST patch the app name and region, otherwise flyctl won't know where to deploy the new app
+                let existingToml = await fs.readFile(tomlPath, 'utf8');
+                
+                // Strip existing headers to avoid conflict
+                existingToml = existingToml.replace(/^\[app\]\s*$/gm, '');
+                existingToml = existingToml.replace(/^(app|name)\s*=.*/gm, '');
+                existingToml = existingToml.replace(/^primary_region\s*=.*/gm, '');
+                
+                const header = `app = "${appName}"\nprimary_region = "${region}"\n`;
+                await fs.writeFile(tomlPath, header + existingToml.trim());
+                stream(`Patched fly.toml with app="${appName}" and region="${region}"`, "info");
+            } catch (e) {
+                throw new Error("You selected 'Prefer existing config', but 'fly.toml' was not found in the repository.");
+            }
         } else {
-            stream("Using repository Dockerfile", "info");
+            // Standard Path: Write config from inputs
+            let finalToml = flyToml;
+            finalToml = finalToml.replace(/^\[app\]\s*$/gm, '');
+            finalToml = finalToml.replace(/^(app|name)\s*=.*/gm, '');
+            finalToml = finalToml.replace(/^primary_region\s*=.*/gm, '');
+            
+            const header = `app = "${appName}"\nprimary_region = "${region}"\n`;
+            finalToml = header + finalToml.trim();
+
+            await fs.writeFile(tomlPath, finalToml);
+            
+            if (dockerfile) {
+                await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
+                stream("Using AI-generated Dockerfile", "info");
+            } else {
+                stream("Using repository Dockerfile", "info");
+            }
         }
 
         // 2. Create/Check App
         const flyExe = await ensureFlyCtl();
-        
-        // Setup PATH for the execa calls
         const localPath = path.dirname(flyExe);
         const envPath = `${localPath}:${process.env.PATH}`;
         
@@ -523,8 +550,6 @@ app.post('/api/deploy', async (req, res) => {
         stream("Starting remote builder...", "log");
         stream("This may take a few minutes. Streaming logs...", "log");
 
-        // We use spawn directly or execa with stream
-        // High availability off for free tier speed
         const deployArgs = ['deploy', '--ha=false']; 
         
         const deployProcess = execa(flyExe, deployArgs, {
@@ -573,7 +598,6 @@ if (process.env.NODE_ENV === 'production' && !IS_VERCEL) {
     app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../dist/index.html')));
 }
 
-// Only listen if we are NOT in a serverless environment (Vercel exports the app)
 if (!IS_VERCEL) {
     app.listen(port, '0.0.0.0', () => console.log(`🚀 Backend running on port ${port}`));
 }

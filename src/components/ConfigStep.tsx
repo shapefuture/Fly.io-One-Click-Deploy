@@ -3,48 +3,10 @@ import { GlassCard } from './GlassCard';
 import { FileCode, Rocket, ArrowLeft, Cpu, ShieldAlert, Globe, Link as LinkIcon, Database, Activity, Download } from 'lucide-react';
 
 export const ConfigStep = () => {
-  const { generatedConfig, setConfig, setStep, sessionId, flyToken, appName, region, repoUrl, githubToken, addLog, setDeployedUrl, setStep: setAppStep } = useDeployStore();
+  const { generatedConfig, setConfig, setStep, sessionId, flyToken, appName, region, repoUrl, githubToken, addLog, setDeployedUrl, deployApp } = useDeployStore();
 
-  const handleDeploy = async () => {
-    setAppStep('deploying');
-    try {
-      const response = await fetch('/api/deploy', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId, flyToken, appName, region, repoUrl, githubToken,
-          flyToml: generatedConfig?.fly_toml,
-          dockerfile: generatedConfig?.dockerfile
-        })
-      });
-
-      const reader = response.body?.getReader();
-      const decoder = new TextDecoder();
-      if (!reader) throw new Error("Failed to stream logs");
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n\n');
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-                const data = JSON.parse(line.slice(6));
-                if (data.type === 'success') {
-                    setDeployedUrl(data.appUrl);
-                    setAppStep('success');
-                    return;
-                } else {
-                    addLog({ message: data.message, type: data.type });
-                }
-            } catch (e) { console.error("Parse error on chunk", line); }
-          }
-        }
-      }
-    } catch (e: any) {
-        addLog({ message: `Fatal error: ${e.message}`, type: 'error' });
-    }
+  const handleDeploy = () => {
+      deployApp();
   };
 
   const downloadConfig = () => {
