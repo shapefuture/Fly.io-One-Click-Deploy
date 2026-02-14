@@ -1,0 +1,7 @@
+node_modules
+backend/node_modules
+backend/temp_workspaces
+dist
+.git
+.env
+.DS_Store

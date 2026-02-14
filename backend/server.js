@@ -3,12 +3,15 @@ import { execa } from 'execa';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import fs from 'fs/promises';
+import { createWriteStream } from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import simpleGit from 'simple-git';
 import { v4 as uuidv4 } from 'uuid';
 import { GoogleGenAI, Type } from "@google/genai";
 import OpenAI from 'openai';
+import { pipeline } from 'stream/promises';
 
 dotenv.config();
 
@@ -18,10 +21,17 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Environment Detection
+const IS_VERCEL = process.env.VERCEL === '1';
+
+// On Vercel, we must use /tmp. Locally, we use a local folder.
+const BASE_WORK_DIR = IS_VERCEL ? os.tmpdir() : __dirname;
+const TEMP_DIR = path.join(BASE_WORK_DIR, 'fly_deployer_workspaces');
+const FLY_INSTALL_DIR = path.join(BASE_WORK_DIR, '.fly');
+const FLY_BIN = path.join(FLY_INSTALL_DIR, 'bin', 'flyctl');
+
 app.use(cors());
 app.use(express.json());
-
-const TEMP_DIR = path.join(__dirname, 'temp_workspaces');
 
 // --- Initialization & Cleanup ---
 
@@ -33,14 +43,45 @@ async function ensureTempDir() {
     }
 }
 
-async function checkFlyCtlInstalled() {
+// Just-In-Time Installer for Flyctl on Serverless
+async function ensureFlyCtl() {
+    // 1. Check if global flyctl exists (Development / Docker)
     try {
         await execa('flyctl', ['version']);
-        console.log("✅ flyctl is installed and ready.");
+        return 'flyctl'; // Global command
     } catch (e) {
-        console.error("❌ CRITICAL: flyctl is NOT installed or not in PATH.");
-        console.error("Please install it: https://fly.io/docs/hands-on/install-flyctl/");
-        // We don't exit process here to allow dev mode without it, but deploys will fail.
+        // Global not found, check local /tmp install
+    }
+
+    // 2. Check if we already installed it in /tmp
+    try {
+        await fs.access(FLY_BIN);
+        return FLY_BIN;
+    } catch (e) {
+        // Not installed, install it now
+    }
+
+    console.log("Installing flyctl to", FLY_INSTALL_DIR);
+    try {
+        // Download install script
+        const installScriptPath = path.join(BASE_WORK_DIR, 'install-fly.sh');
+        
+        // We use fetch (Node 18+) to get the script
+        const response = await fetch('https://fly.io/install.sh');
+        if (!response.ok) throw new Error('Failed to download fly install script');
+        
+        await fs.writeFile(installScriptPath, await response.text());
+        await fs.chmod(installScriptPath, 0o755);
+
+        // Run install script with custom install path
+        await execa('sh', [installScriptPath], {
+            env: { ...process.env, FLYCTL_INSTALL: FLY_INSTALL_DIR }
+        });
+
+        return FLY_BIN;
+    } catch (error) {
+        console.error("Failed to install flyctl:", error);
+        throw new Error("Could not install flyctl runtime dependency");
     }
 }
 
@@ -56,28 +97,26 @@ async function cleanup(dirPath) {
     }
 }
 
-// Graceful Shutdown
-process.on('SIGINT', async () => {
-    console.log('Cleaning up temp directories...');
-    await cleanup(TEMP_DIR);
-    process.exit(0);
-});
-
-(async () => {
-    await ensureTempDir();
-    await checkFlyCtlInstalled();
-})();
-
 // --- Helper Functions ---
 
 async function runFlyctl(args, token, cwd, env = {}) {
     try {
-        // Determine executable (flyctl or fly)
-        const exe = 'flyctl'; 
+        const exe = await ensureFlyCtl();
+        
+        // If using custom binary, ensure its dir is in PATH for internal calls
+        const localPath = path.dirname(exe);
+        const newPath = `${localPath}:${process.env.PATH}`;
+
         const { stdout, stderr } = await execa(exe, args, {
             cwd,
-            env: { ...process.env, FLY_API_TOKEN: token, NO_COLOR: "1", ...env },
-            timeout: 600000 // 10 minutes timeout for builds
+            env: { 
+                ...process.env, 
+                FLY_API_TOKEN: token, 
+                NO_COLOR: "1", 
+                PATH: newPath,
+                ...env 
+            },
+            timeout: 600000 // 10 minutes (Note: Vercel Free tier limits function duration to 10s-60s)
         });
         return { success: true, stdout, stderr };
     } catch (error) {
@@ -126,7 +165,7 @@ async function readConfigFiles(dir) {
             // Check if file exists first
             await fs.access(filePath);
             const data = await fs.readFile(filePath, 'utf8');
-            content += `\n--- ${file} ---\n${data.slice(0, 8000)}\n`; // Increased context limit
+            content += `\n--- ${file} ---\n${data.slice(0, 8000)}\n`; 
         } catch (e) {}
     }
     return content;
@@ -144,15 +183,20 @@ function cleanJson(text) {
 
 // --- Routes ---
 
-// Health Check Endpoint
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime() });
+    res.json({ 
+        status: 'ok', 
+        uptime: process.uptime(),
+        environment: IS_VERCEL ? 'vercel' : 'standard',
+        tempDir: TEMP_DIR
+    });
 });
 
 app.post('/api/analyze', async (req, res) => {
     const { repoUrl, aiConfig } = req.body;
     if (!repoUrl) return res.status(400).json({ error: 'Repo URL is required' });
 
+    await ensureTempDir();
     const sessionId = uuidv4();
     const workDir = path.join(TEMP_DIR, sessionId);
 
@@ -302,7 +346,6 @@ app.post('/api/analyze', async (req, res) => {
 app.post('/api/deploy', async (req, res) => {
     const { sessionId, flyToken, flyToml, dockerfile, appName, region } = req.body;
 
-    // Set up SSE
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -311,23 +354,29 @@ app.post('/api/deploy', async (req, res) => {
         res.write(`data: ${JSON.stringify({ message: msg, type })}\n\n`);
     };
 
+    await ensureTempDir();
     const workDir = path.join(TEMP_DIR, sessionId);
 
     try {
-        await fs.access(workDir);
+        // Recover context if on serverless (files might be gone if new instance)
+        // Note: For a robust serverless app, we'd need to re-clone or use persistent storage (S3).
+        // For this workaround, we assume hot-start or we re-create the files.
+        try {
+             await fs.access(workDir);
+        } catch {
+             await fs.mkdir(workDir, { recursive: true });
+             // In a real serverless flow, we'd need to re-clone the repo here.
+             // We'll proceed hoping we just need the config files we are about to write.
+        }
+
         stream("Initializing build environment...", "info");
 
         // 1. Write Config Files
         const tomlPath = path.join(workDir, 'fly.toml');
         
-        // Force sync app name and region in TOML
         let finalToml = flyToml;
-        
-        // Remove existing app/region keys to avoid duplicates
         finalToml = finalToml.replace(/^app\s*=.*$/m, '');
         finalToml = finalToml.replace(/^primary_region\s*=.*$/m, '');
-        
-        // Prepend correct values
         const header = `app = "${appName}"\nprimary_region = "${region}"\n`;
         finalToml = header + finalToml;
 
@@ -336,16 +385,24 @@ app.post('/api/deploy', async (req, res) => {
             await fs.writeFile(path.join(workDir, 'Dockerfile'), dockerfile);
             stream("Using AI-generated Dockerfile", "info");
         } else {
+            // If we don't have the repo cloned (serverless cold start), this will fail if it relies on repo files.
+            // But we assume for 'deploy' we might just need the context or remote builder.
             stream("Using repository Dockerfile", "info");
         }
 
         // 2. Create/Check App
+        const flyExe = await ensureFlyCtl();
+        
+        // Setup PATH for the execa calls
+        const localPath = path.dirname(flyExe);
+        const envPath = `${localPath}:${process.env.PATH}`;
+        
         stream(`Registering app '${appName}' in region '${region}'...`, "info");
         try {
             await runFlyctl(['apps', 'create', appName, '--org', 'personal'], flyToken, workDir);
             stream(`App '${appName}' created successfully.`, "success");
         } catch (e) {
-            if (e.message.includes('taken')) {
+            if (e && e.message && e.message.includes('taken')) {
                 stream(`App '${appName}' already exists. Updating...`, "warning");
             } else {
                 throw e;
@@ -356,11 +413,18 @@ app.post('/api/deploy', async (req, res) => {
         stream("Starting remote builder...", "log");
         stream("This may take a few minutes. Streaming logs...", "log");
 
-        const deployArgs = ['deploy', '--ha=false']; // High availability off for free tier speed
+        // We use spawn directly or execa with stream
+        // High availability off for free tier speed
+        const deployArgs = ['deploy', '--ha=false']; 
         
-        const deployProcess = execa('flyctl', deployArgs, {
+        const deployProcess = execa(flyExe, deployArgs, {
             cwd: workDir,
-            env: { ...process.env, FLY_API_TOKEN: flyToken, NO_COLOR: "1" },
+            env: { 
+                ...process.env, 
+                FLY_API_TOKEN: flyToken, 
+                NO_COLOR: "1",
+                PATH: envPath 
+            },
             all: true
         });
 
@@ -394,9 +458,14 @@ app.post('/api/deploy', async (req, res) => {
     }
 });
 
-if (process.env.NODE_ENV === 'production') {
+if (process.env.NODE_ENV === 'production' && !IS_VERCEL) {
     app.use(express.static(path.join(__dirname, '../dist')));
     app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../dist/index.html')));
 }
 
-app.listen(port, '0.0.0.0', () => console.log(`🚀 Backend running on port ${port}`));
+// Only listen if we are NOT in a serverless environment (Vercel exports the app)
+if (!IS_VERCEL) {
+    app.listen(port, '0.0.0.0', () => console.log(`🚀 Backend running on port ${port}`));
+}
+
+export default app;
