@@ -134,10 +134,10 @@ export const useDeployStore = create<DeployState>()(
                     const jsonStr = line.slice(6);
                     const data = JSON.parse(jsonStr);
                     
-                    if (data.type === 'success') {
+                    // Critical Fix: Only treat as success if URL is present.
+                    // This prevents intermediate success messages from closing the stream.
+                    if (data.type === 'success' && data.appUrl) {
                         set({ deployedUrl: data.appUrl, currentStep: 'success' });
-                        // Don't return immediately, process remaining buffer if needed, 
-                        // but usually success is the last message.
                         return;
                     } else {
                         get().addLog({ message: data.message, type: data.type });

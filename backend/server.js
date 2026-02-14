@@ -458,20 +458,30 @@ app.post('/api/deploy', async (req, res) => {
             if (createProc.stderr) createProc.stderr.on('data', d => stream(`[Reg] ${d.toString().trim()}`, 'log'));
             await createProc;
             
-            stream("App registered.", "success");
+            // NOTE: Changed type from 'success' to 'info' to avoid premature frontend completion
+            stream("App registered.", "info");
         } catch (e) {
             const err = (e.stderr || '') + (e.stdout || '');
             if (err.includes('taken') || err.includes('exists')) stream("App exists, updating...", "warning");
             else {
-                // Keep going if it's just an error about existing, otherwise rethrow
-                // But the previous check usually catches it.
-                // If it failed for other reasons, the stream logs above would show it.
                 if (!err.includes('taken') && !err.includes('exists')) throw new Error(`Registration failed: ${e.message}`);
             }
         }
 
+        // Add small delay for propagation
+        await new Promise(r => setTimeout(r, 2000));
+
         stream("Deploying...", "log");
-        const proc = execa(flyExe, ['deploy', '--ha=false', '--wait-timeout', '600'], {
+        
+        // Added --remote-only to force remote builder (Vercel has no local docker)
+        // Added --config to be explicit
+        const proc = execa(flyExe, [
+            'deploy', 
+            '--ha=false', 
+            '--wait-timeout', '600',
+            '--remote-only', 
+            '--config', 'fly.toml'
+        ], {
             cwd: targetDir,
             env: DEPLOY_ENV
         });
@@ -484,6 +494,7 @@ app.post('/api/deploy', async (req, res) => {
         const statusProc = await execa(flyExe, ['status', '--json'], { env: DEPLOY_ENV });
         const status = JSON.parse(statusProc.stdout);
         
+        // This is the ONLY place that should trigger currentStep = 'success'
         res.write(`data: ${JSON.stringify({ type: 'success', appUrl: `https://${status.Hostname}`, appName: status.Name })}\n\n`);
 
     } catch (e) {
