@@ -437,24 +437,31 @@ app.post('/api/analyze', async (req, res) => {
                     json.fly_toml = json.fly_toml.replace(/handlers = \['http'\]/g, "handlers = []");
                 }
 
-                // 2. Env Vars Definition (Double down on variables)
+                // 2. Env Vars Definition (Double down on variables with CORRECT structure)
+                // Using double underscore __ for nested YAML keys as per sniproxy conventions
                 const safetyVars = {
+                    "SNIPROXY_GENERAL__PUBLIC_IPV4": "127.0.0.1",
+                    "SNIPROXY_GENERAL__PUBLIC_IPV6": "::1",
+                    "SNIPROXY_GENERAL__BIND_HTTP": "0.0.0.0:80",
+                    "SNIPROXY_GENERAL__BIND_HTTPS": "0.0.0.0:443",
+                    "GOMAXPROCS": "1",
+                    // Keep the flat ones too just in case the binary uses them as fallback
                     "PUBLIC_IPV4": "127.0.0.1",
-                    "PUBLIC_IPV6": "::1",
-                    "SNIPROXY_PUBLIC_IPV4": "127.0.0.1",
-                    "SNIPROXY_PUBLIC_IPV6": "::1",
-                    "BIND_HTTP": "0.0.0.0:80",
-                    "BIND_HTTPS": "0.0.0.0:443",
-                    "SNIPROXY_BIND_HTTP": "0.0.0.0:80",
-                    "SNIPROXY_BIND_HTTPS": "0.0.0.0:443",
-                    "GOMAXPROCS": "1"
+                    "PUBLIC_IPV6": "::1"
                 };
 
                 // 3. Inject [env] into fly.toml SAFELY (Fix for duplicate table error)
                 if (json.fly_toml) {
-                     // FIRST: Remove any existing keys to prevent duplicates
-                     Object.keys(safetyVars).forEach(key => {
-                         // Regex matches "KEY = 'VAL'" or "KEY="VAL"" at start of line
+                     // FIRST: Remove any existing keys to prevent duplicates (regex matches start of line)
+                     // We remove ALL potential conflict keys: standard flat ones AND the new nested ones
+                     const keysToRemove = [
+                        "PUBLIC_IPV4", "PUBLIC_IPV6", "BIND_HTTP", "BIND_HTTPS", 
+                        "SNIPROXY_GENERAL__PUBLIC_IPV4", "SNIPROXY_GENERAL__PUBLIC_IPV6",
+                        "SNIPROXY_GENERAL__BIND_HTTP", "SNIPROXY_GENERAL__BIND_HTTPS",
+                        "GOMAXPROCS"
+                     ];
+
+                     keysToRemove.forEach(key => {
                          const regex = new RegExp(`^\\s*${key}\\s*=.*$`, 'gm');
                          json.fly_toml = json.fly_toml.replace(regex, '');
                      });
@@ -475,7 +482,6 @@ app.post('/api/analyze', async (req, res) => {
 
                 // 4. Update UI Env Vars for visibility
                 if (!json.envVars) json.envVars = [];
-                // Ensure we are working with an array
                 const varsArr = Array.isArray(json.envVars) ? json.envVars : [];
                 Object.entries(safetyVars).forEach(([k, v]) => {
                     if (!varsArr.find(e => e.name === k)) {
@@ -484,25 +490,30 @@ app.post('/api/analyze', async (req, res) => {
                 });
                 json.envVars = varsArr;
 
-                // 5. Generate a Hardcoded config.yaml that bypasses the public IP check
+                // 5. Generate a Hardcoded config.yaml that MATCHES THE APPLICATION STRUCTURE (Nested)
                 const sniproxyConfig = `
-public_ipv4: "127.0.0.1"
-public_ipv6: "::1"
-bind_http: "0.0.0.0:80"
-bind_https: "0.0.0.0:443"
-upstream_dns: "1.1.1.1"
+general:
+  public_ipv4: "127.0.0.1"
+  public_ipv6: "::1"
+  bind_http: "0.0.0.0:80"
+  bind_https: "0.0.0.0:443"
+  upstream_dns: "1.1.1.1"
 `;
                 // Add this to a files array to be written in deploy step
                 json.files = [{ name: "config.yaml", content: sniproxyConfig }];
 
-                // 6. OVERRIDE DOCKERFILE with a robust Alpine version that copies the config
-                // This ignores the existing Dockerfile to ensure we can inject the config file.
+                // 6. OVERRIDE DOCKERFILE with a robust build process
+                // Attempts to build ./cmd/sniproxy OR . to support monorepo layouts
                 json.dockerfile = `FROM golang:alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache git
 COPY . .
-WORKDIR /app/cmd/sniproxy
-RUN go build -ldflags "-s -w" -o /sniproxy .
+# Build attempts: specific cmd path first, then root
+RUN if [ -d "./cmd/sniproxy" ]; then \
+      go build -ldflags "-s -w" -o /sniproxy ./cmd/sniproxy; \
+    else \
+      go build -ldflags "-s -w" -o /sniproxy .; \
+    fi
 
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates
@@ -512,7 +523,7 @@ ENTRYPOINT ["/sniproxy", "-c", "/config.yaml"]
 `;
                 
                 // 7. Update explanation
-                json.explanation = (json.explanation || "") + " [System] Applied Max Fallback: Replaced Dockerfile to inject 'config.yaml', merged [env] variables, and force-bypass Public IP checks.";
+                json.explanation = (json.explanation || "") + " [System] Applied Max Fallback: Injected nested 'config.yaml', double-underscore env vars, and monorepo-aware build.";
             }
 
             const envVars = {};
