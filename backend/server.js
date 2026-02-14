@@ -348,21 +348,17 @@ app.post('/api/analyze', async (req, res) => {
 
         const hasDockerfile = context.includes("Dockerfile:");
 
-        // STRICT PROMPT: Enforcing the 'Combined' structure with SINGLE QUOTES
+        // STRICT PROMPT: Enforce SINGLE QUOTES and PROTECT existing Dockerfiles
         const prompt = `DevOps Task: Config for Fly.io. Repo: ${repoUrl}. Context: ${context}. Return JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}.
         
-        CRITICAL RULES for fly.toml:
-        1. USE SINGLE QUOTES (') for strings, not double quotes.
-        2. Do NOT use a string for 'checks'.
-        3. Use explicit [[services]] definitions for ports.
-        4. Combine robust VM settings (auto_start/stop, shared cpu) with specific service checks.
-        5. Ensure [[vm]] section includes BOTH: memory = '1gb' AND memory_mb = 256.
-        6. Dockerfile Strategy:
-           - If a Dockerfile already exists in Context, return null for 'dockerfile' field unless it is clearly broken.
-           - If generating a Dockerfile, MUST use JSON array syntax for CMD. Example: CMD ["/app/binary"]. NEVER use string with brackets like CMD "['/bin']".
+        CRITICAL RULES:
+        1. fly.toml strings MUST use SINGLE QUOTES (e.g. app = 'name').
+        2. [[vm]] section MUST include BOTH: memory = '1gb' AND memory_mb = 1024 (or 256).
+        3. If a Dockerfile ALREADY EXISTS in the context, set the 'dockerfile' field in JSON to null. DO NOT generate a new one.
+        4. If generating a Dockerfile (only if missing), use JSON array syntax for CMD.
         
         Preferred fly.toml Structure:
-        app = 'app'
+        app = 'app-name'
         primary_region = 'iad'
 
         [build]
@@ -387,13 +383,6 @@ app.post('/api/analyze', async (req, res) => {
         [[services.ports]]
             port = 443
             handlers = ['tls', 'http']
-        
-        [[services.checks]]
-            type = 'http'
-            path = '/'
-            interval = '10s'
-            timeout = '2s'
-            grace_period = '5s'
         `;
 
         try {
@@ -419,21 +408,20 @@ app.post('/api/analyze', async (req, res) => {
                 json = JSON.parse(result.text);
             }
             
-            const envVars = {};
-            if (json.envVars) json.envVars.forEach(e => envVars[e.name] = e.reason);
-
-            // Double check Dockerfile logic
-            if (hasDockerfile && json.dockerfile) {
-                 // Optionally log that we are overwriting, or choose to ignore AI's dockerfile if trustExisting is logic
+            // STRICT PROTECTION: If context had Dockerfile, force null to prevent overwrite
+            if (hasDockerfile) {
+                json.dockerfile = null;
             }
 
+            const envVars = {};
+            if (json.envVars) json.envVars.forEach(e => envVars[e.name] = e.reason);
             res.json({ success: true, sessionId, ...json, envVars });
 
         } catch (e) {
             console.error("AI Error:", e);
             res.json({
                 success: true, sessionId,
-                // FALLBACK: The "Combined" config requested by user (SINGLE QUOTES)
+                // FALLBACK with SINGLE QUOTES and DUAL MEMORY settings
                 fly_toml: `app = 'app'
 primary_region = 'iad'
 
@@ -459,16 +447,10 @@ primary_region = 'iad'
   [[services.ports]]
     port = 443
     handlers = ['tls', 'http']
-    
-  [[services.checks]]
-    type = 'http'
-    path = '/'
-    interval = '10s'
-    timeout = '2s'
-    grace_period = '5s'
 `,
+                // Don't overwrite if it exists
                 dockerfile: hasDockerfile ? null : 'FROM node:18-alpine\nWORKDIR /app\nCOPY . .\nRUN npm ci\nCMD ["npm", "start"]',
-                explanation: "Fallback config used (Combined Format).",
+                explanation: "Fallback config used.",
                 envVars: {PORT: "8080"}, stack: "Fallback"
             });
         }
@@ -491,8 +473,6 @@ app.post('/api/deploy', async (req, res) => {
         const flyExe = await getFlyExe();
         const exeDir = path.dirname(flyExe);
         
-        // Critical: Ensure Vercel environment vars are set for child process
-        // AND Anti-Hang flags: CI=1, NO_UPDATE_CHECK=1
         const DEPLOY_ENV = {
             ...process.env,
             FLY_API_TOKEN: flyToken,
@@ -500,18 +480,16 @@ app.post('/api/deploy', async (req, res) => {
             FLYCTL_INSTALL: FLY_INSTALL_DIR,
             PATH: `${exeDir}${path.delimiter}${process.env.PATH}`,
             NO_COLOR: "1",
-            CI: "1", // Forces non-interactive mode
-            FLY_NO_UPDATE_CHECK: "1", // Prevents update checks hanging
+            CI: "1",
+            FLY_NO_UPDATE_CHECK: "1",
             FLY_CHECK_UPDATE: "false"
         };
 
         let targetDir = workDir;
         try {
             await fs.access(workDir);
-            // Check if directory is empty or populated
             const list = await fs.readdir(workDir);
             if (list.length === 0) throw new Error("empty");
-            
             const root = list.find(n => !n.startsWith('.'));
             if (root && (await fs.stat(path.join(workDir, root))).isDirectory()) {
                 targetDir = path.join(workDir, root);
@@ -530,10 +508,7 @@ app.post('/api/deploy', async (req, res) => {
              try { tomlContent = await fs.readFile(tomlPath, 'utf8'); } catch { throw new Error("Missing fly.toml"); }
         }
         
-        // Sanitize TOML (CRITICAL FIX FOR 'checks' ERROR)
-        // 1. Force app name and region (SINGLE QUOTES)
-        // 2. Remove existing app/region keys
-        // 3. Remove invalid top-level checks="string" which breaks flyctl
+        // Sanitize TOML: Force SINGLE QUOTES for app/region
         tomlContent = `app = '${appName}'\nprimary_region = '${region}'\n` + 
             tomlContent.replace(/^app\s*=.*$/gm, '')
                        .replace(/^primary_region\s*=.*$/gm, '')
@@ -541,18 +516,19 @@ app.post('/api/deploy', async (req, res) => {
                        .replace(/^checks\s*=\s*'.*'/gm, ''); 
             
         await fs.writeFile(tomlPath, tomlContent);
-        // Only write Dockerfile if specifically provided (AI generated one or user edited it)
-        if (dockerfile) await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
+        
+        // CRITICAL: Only write Dockerfile if specifically provided AND NOT NULL
+        // This protects the 'scratch' dockerfile from being overwritten
+        if (dockerfile && typeof dockerfile === 'string' && dockerfile.trim().length > 0) {
+            await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
+        }
 
         stream("Registering app...", "info");
         try {
-            // Using execa with listeners to stream any errors/prompts instead of silent hang
             const createProc = execa(flyExe, ['apps', 'create', appName], { env: DEPLOY_ENV });
             if (createProc.stdout) createProc.stdout.on('data', d => stream(`[Reg] ${d.toString().trim()}`, 'log'));
             if (createProc.stderr) createProc.stderr.on('data', d => stream(`[Reg] ${d.toString().trim()}`, 'log'));
             await createProc;
-            
-            // NOTE: Changed type from 'success' to 'info' to avoid premature frontend completion
             stream("App registered.", "info");
         } catch (e) {
             const err = (e.stderr || '') + (e.stdout || '');
@@ -562,13 +538,10 @@ app.post('/api/deploy', async (req, res) => {
             }
         }
 
-        // Add small delay for propagation
         await new Promise(r => setTimeout(r, 2000));
 
         stream("Deploying...", "log");
         
-        // Added --remote-only to force remote builder (Vercel has no local docker)
-        // Added --config to be explicit
         const proc = execa(flyExe, [
             'deploy', 
             '--ha=false', 
@@ -588,7 +561,6 @@ app.post('/api/deploy', async (req, res) => {
         const statusProc = await execa(flyExe, ['status', '--json'], { env: DEPLOY_ENV });
         const status = JSON.parse(statusProc.stdout);
         
-        // This is the ONLY place that should trigger currentStep = 'success'
         res.write(`data: ${JSON.stringify({ type: 'success', appUrl: `https://${status.Hostname}`, appName: status.Name })}\n\n`);
 
     } catch (e) {
