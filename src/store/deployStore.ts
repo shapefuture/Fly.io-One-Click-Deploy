@@ -112,23 +112,38 @@ export const useDeployStore = create<DeployState>()(
           const decoder = new TextDecoder();
           if (!reader) throw new Error("Stream initialization failed");
 
+          let buffer = '';
+
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            const chunk = decoder.decode(value);
-            const lines = chunk.split('\n\n');
-            for (const line of lines) {
-              if (line.trim().startsWith('data: ')) {
+            
+            // Append new chunk to buffer
+            buffer += decoder.decode(value, { stream: true });
+            
+            // Split by double newline (SSE standard delimiter)
+            const parts = buffer.split('\n\n');
+            
+            // Keep the last part in buffer as it might be incomplete
+            buffer = parts.pop() || '';
+
+            for (const part of parts) {
+              const line = part.trim();
+              if (line.startsWith('data: ')) {
                 try {
-                    const data = JSON.parse(line.trim().slice(6));
+                    const jsonStr = line.slice(6);
+                    const data = JSON.parse(jsonStr);
+                    
                     if (data.type === 'success') {
                         set({ deployedUrl: data.appUrl, currentStep: 'success' });
+                        // Don't return immediately, process remaining buffer if needed, 
+                        // but usually success is the last message.
                         return;
                     } else {
                         get().addLog({ message: data.message, type: data.type });
                     }
                 } catch (e) { 
-                    // Silent catch for partial chunks
+                    console.warn("Failed to parse log chunk:", line);
                 }
               }
             }

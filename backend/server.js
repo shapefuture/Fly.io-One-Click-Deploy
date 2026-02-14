@@ -309,8 +309,8 @@ async function downloadRepo(repoUrl, targetDir, githubToken) {
 app.get('/api/health', (req, res) => {
     res.json({ 
         status: 'ok', 
-        uptime: process.uptime(),
-        env: IS_VERCEL ? 'vercel' : 'node',
+        uptime: process.uptime(), 
+        env: IS_VERCEL ? 'vercel' : 'node', 
         flyInstalled: !!flyBinPath,
         error: lastInstallError
     });
@@ -405,13 +405,17 @@ app.post('/api/deploy', async (req, res) => {
         const exeDir = path.dirname(flyExe);
         
         // Critical: Ensure Vercel environment vars are set for child process
+        // AND Anti-Hang flags: CI=1, NO_UPDATE_CHECK=1
         const DEPLOY_ENV = {
             ...process.env,
             FLY_API_TOKEN: flyToken,
             HOME: VERCEL_HOME,
             FLYCTL_INSTALL: FLY_INSTALL_DIR,
             PATH: `${exeDir}${path.delimiter}${process.env.PATH}`,
-            NO_COLOR: "1"
+            NO_COLOR: "1",
+            CI: "1", // Forces non-interactive mode
+            FLY_NO_UPDATE_CHECK: "1", // Prevents update checks hanging
+            FLY_CHECK_UPDATE: "false"
         };
 
         let targetDir = workDir;
@@ -448,12 +452,22 @@ app.post('/api/deploy', async (req, res) => {
 
         stream("Registering app...", "info");
         try {
-            await execa(flyExe, ['apps', 'create', appName], { env: DEPLOY_ENV });
+            // Using execa with listeners to stream any errors/prompts instead of silent hang
+            const createProc = execa(flyExe, ['apps', 'create', appName], { env: DEPLOY_ENV });
+            if (createProc.stdout) createProc.stdout.on('data', d => stream(`[Reg] ${d.toString().trim()}`, 'log'));
+            if (createProc.stderr) createProc.stderr.on('data', d => stream(`[Reg] ${d.toString().trim()}`, 'log'));
+            await createProc;
+            
             stream("App registered.", "success");
         } catch (e) {
             const err = (e.stderr || '') + (e.stdout || '');
             if (err.includes('taken') || err.includes('exists')) stream("App exists, updating...", "warning");
-            else throw new Error(`Registration failed: ${e.message}`);
+            else {
+                // Keep going if it's just an error about existing, otherwise rethrow
+                // But the previous check usually catches it.
+                // If it failed for other reasons, the stream logs above would show it.
+                if (!err.includes('taken') && !err.includes('exists')) throw new Error(`Registration failed: ${e.message}`);
+            }
         }
 
         stream("Deploying...", "log");
