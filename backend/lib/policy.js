@@ -29,7 +29,22 @@ export const PolicyEngine = {
             }
         }
 
-        // 2. Legacy "Config Healer" for Proxy Dockerfiles
+        // 2. TOML Handler Sanitization (The "TCP Healer")
+        // AI and legacy configs often hallucinate "handlers = ['tcp']" which is invalid in Fly V2.
+        const tomlPath = path.join(targetDir, 'fly.toml');
+        if (existsSync(tomlPath)) {
+            let tomlContent = await fs.readFile(tomlPath, 'utf8');
+            if (tomlContent.includes("handlers = ['tcp']") || tomlContent.includes('handlers = ["tcp"]')) {
+                stream("🛡️ Policy: Detected invalid 'tcp' handler in fly.toml. Healing...", "warning");
+                // Replace with empty array (Raw TCP)
+                tomlContent = tomlContent
+                    .replace(/handlers\s*=\s*\['tcp'\]/g, "handlers = []")
+                    .replace(/handlers\s*=\s*\["tcp"\]/g, "handlers = []");
+                await fs.writeFile(tomlPath, tomlContent);
+            }
+        }
+
+        // 3. Legacy "Config Healer" for Proxy Dockerfiles
         // If Dockerfile expects config.yaml but it's missing, generate a safe default.
         const dockerfilePath = path.join(targetDir, 'Dockerfile');
         if (existsSync(dockerfilePath)) {

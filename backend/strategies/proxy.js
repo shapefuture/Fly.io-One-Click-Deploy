@@ -21,24 +21,33 @@ export const ProxyStrategy = {
 
         const envContent = Object.entries(safetyVars).map(([k, v]) => `  ${k} = '${v}'`).join('\n');
         
+        // CORRECTION: Use two separate service blocks to map ports correctly (80->80, 443->443)
+        // CORRECTION: handlers = [] for raw TCP (Fly.io rejects 'tcp' as a handler name)
         const fly_toml = `app = '${appName}'
 primary_region = 'iad'
 
 [env]
 ${envContent}
 
+# Service for HTTP (Port 80)
 [[services]]
   protocol = 'tcp'
   internal_port = 80
   processes = ['app']
+  
+  [[services.ports]]
+    port = 80
+    handlers = []
 
-[[services.ports]]
-  port = 80
-  handlers = ['tcp']
-
-[[services.ports]]
-  port = 443
-  handlers = ['tcp']
+# Service for HTTPS (Port 443)
+[[services]]
+  protocol = 'tcp'
+  internal_port = 443
+  processes = ['app']
+  
+  [[services.ports]]
+    port = 443
+    handlers = []
 
 [[vm]]
   memory = '512mb'

@@ -72,3 +72,4 @@ To be universal, the system must transition from **Hardcoded Logic** to **Declar
 | **5** | **Secrets UI** | Add a dynamic key-value editor to the `ConfigStep` for runtime secrets. | [X] |
 | **6** | **Pre-flight Checks** | Add a phase to verify token permissions and "Organization" status before starting the remote build. | [X] |
 | **7** | **Optimization: Policy Engine** | Extracted hardcoded deployment patches into a dedicated Policy Engine and switched to memory-safe streaming downloads. | [X] |
+| **8** | **Bugfix: Invalid Handlers** | Fixed `fly.toml` generation in ProxyStrategy to prevent "Handlers must be one of..." error and added a safety heuristic to PolicyEngine. | [X] |
