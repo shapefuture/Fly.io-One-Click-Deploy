@@ -100,7 +100,7 @@ async function cleanup(dirPath) {
     }
 }
 
-async function downloadRepo(repoUrl, targetDir) {
+async function downloadRepo(repoUrl, targetDir, githubToken) {
     // 1. Construct Archive URL
     // Remove .git suffix if present
     const cleanUrl = repoUrl.replace(/\.git$/, '').replace(/\/$/, '');
@@ -109,9 +109,15 @@ async function downloadRepo(repoUrl, targetDir) {
 
     console.log(`Downloading repo from ${archiveUrl}...`);
     
-    const response = await fetch(archiveUrl);
+    const headers = {};
+    if (githubToken) {
+        headers['Authorization'] = `token ${githubToken}`;
+        headers['User-Agent'] = 'Universal-Fly-Deployer';
+    }
+
+    const response = await fetch(archiveUrl, { headers });
     if (!response.ok) {
-        throw new Error(`Failed to download repository: ${response.status} ${response.statusText}`);
+        throw new Error(`Failed to download repository: ${response.status} ${response.statusText}. ${githubToken ? 'Token provided.' : 'No token.'}`);
     }
     
     const arrayBuffer = await response.arrayBuffer();
@@ -233,7 +239,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.post('/api/analyze', async (req, res) => {
-    const { repoUrl, aiConfig } = req.body;
+    const { repoUrl, aiConfig, githubToken, preferExistingConfig } = req.body;
     if (!repoUrl) return res.status(400).json({ error: 'Repo URL is required' });
 
     await ensureTempDir();
@@ -243,19 +249,32 @@ app.post('/api/analyze', async (req, res) => {
     try {
         await fs.mkdir(workDir, { recursive: true });
         
-        // Replaced git clone with downloadRepo
-        const repoDir = await downloadRepo(repoUrl, workDir);
+        let fileStructure = [];
+        let configContent = "";
+        let analysisMethod = "local";
 
-        const fileStructure = await scanRepoStructure(repoDir);
-        const configContent = await readConfigFiles(repoDir);
+        try {
+            // Try downloading repo
+            const repoDir = await downloadRepo(repoUrl, workDir, githubToken);
+            fileStructure = await scanRepoStructure(repoDir);
+            configContent = await readConfigFiles(repoDir);
+        } catch (e) {
+            console.warn(`[${sessionId}] Repo download failed: ${e.message}. Falling back to AI Search.`);
+            analysisMethod = "search_fallback";
+            
+            // If download failed but we don't have search enabled (Gemini only), we might be stuck.
+            // But we will proceed and hope Gemini can infer from URL or search tool.
+        }
 
         const prompt = `
         You are a Lead DevOps Architect. Analyze this repository to generate a deployment configuration for Fly.io.
 
         Context:
         - The user wants to deploy this application to Fly.io.
-        - We need a 'fly.toml' and potentially a 'Dockerfile'.
-        
+        - Repository URL: ${repoUrl}
+        - Analysis Method: ${analysisMethod === 'local' ? 'Codebase Analysis' : 'Search & Inference (Codebase unavailable)'}
+        ${preferExistingConfig ? "- PREFERENCE: The user prefers to use the existing 'fly.toml' if one is found in the configuration files. Only modify it if strictly necessary for deployment to work." : ""}
+
         Repository File Structure (truncated):
         ${fileStructure.slice(0, 100).join('\n')}
         ${fileStructure.length > 100 ? '... (more files)' : ''}
@@ -273,6 +292,7 @@ app.post('/api/analyze', async (req, res) => {
            - Use the [[services]] or [http_service] block.
            - Set 'auto_stop_machines = true' and 'auto_start_machines = true'.
            - Add a [checks] block for health monitoring if a health endpoint (/health, /up, /) is likely.
+           - IF 'fly.toml' exists in Config Content and user preference is set, REUSE IT unless broken.
         4. **Dockerfile Generation**:
            - **Crucial**: If a 'Dockerfile' already exists in the provided config content, set the 'dockerfile' field in JSON to null. We prefer the user's Dockerfile.
            - If NO Dockerfile exists, generate a **production-grade Multi-Stage** Dockerfile.
@@ -287,9 +307,15 @@ app.post('/api/analyze', async (req, res) => {
         const provider = aiConfig?.provider || 'gemini';
         let rawResult;
         let sources = [];
+        let warnings = [];
 
         if (provider === 'openrouter') {
             console.log(`[${sessionId}] Using OpenRouter with model ${aiConfig.model}`);
+            
+            if (analysisMethod === 'search_fallback') {
+                warnings.push("Analysis is based on limited information because repository download failed and Search is unavailable on OpenRouter.");
+            }
+
             const openai = new OpenAI({
                 baseURL: 'https://openrouter.ai/api/v1',
                 apiKey: aiConfig.apiKey,
@@ -317,14 +343,28 @@ app.post('/api/analyze', async (req, res) => {
         } else {
             // Default to Gemini
             const apiKey = aiConfig?.apiKey || process.env.API_KEY;
+
+            if (!apiKey) {
+                throw new Error("Gemini API Key is missing. Please provide it in AI Settings or ensure the server has a default key.");
+            }
+
             console.log(`[${sessionId}] Using Gemini with model ${aiConfig?.model || 'default'}`);
             
             const ai = new GoogleGenAI({ apiKey });
+            
+            // Only use tools if strictly necessary (e.g. search fallback)
+            // AND we are strictly using Gemini (checked by else block).
+            const tools = [];
+            if (analysisMethod === 'search_fallback') {
+                tools.push({ googleSearch: {} });
+                warnings.push("Codebase download failed. Analysis based on AI search inference.");
+            }
+            
             const response = await ai.models.generateContent({
                 model: aiConfig?.model || 'gemini-3-flash-preview',
                 contents: prompt,
                 config: {
-                    tools: [{ googleSearch: {} }],
+                    tools: tools,
                     responseMimeType: "application/json",
                     responseSchema: {
                         type: Type.OBJECT,
@@ -372,7 +412,8 @@ app.post('/api/analyze', async (req, res) => {
             sessionId, 
             ...rawResult, 
             envVars,
-            sources 
+            sources,
+            warnings
         });
 
     } catch (error) {
@@ -383,7 +424,7 @@ app.post('/api/analyze', async (req, res) => {
 });
 
 app.post('/api/deploy', async (req, res) => {
-    const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl } = req.body;
+    const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl, githubToken } = req.body;
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -420,7 +461,7 @@ app.post('/api/deploy', async (req, res) => {
              if (repoUrl) {
                 stream("Initializing build context...", "info");
                 try {
-                    targetDir = await downloadRepo(repoUrl, workDir);
+                    targetDir = await downloadRepo(repoUrl, workDir, githubToken);
                 } catch (e) {
                     throw new Error(`Failed to download repository context: ${e.message}`);
                 }

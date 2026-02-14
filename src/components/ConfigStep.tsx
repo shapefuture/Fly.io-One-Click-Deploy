@@ -3,7 +3,7 @@ import { GlassCard } from './GlassCard';
 import { FileCode, Rocket, ArrowLeft, Cpu, ShieldAlert, Globe, Link as LinkIcon, Database, Activity, Download } from 'lucide-react';
 
 export const ConfigStep = () => {
-  const { generatedConfig, setConfig, setStep, sessionId, flyToken, appName, region, repoUrl, addLog, setDeployedUrl, setStep: setAppStep } = useDeployStore();
+  const { generatedConfig, setConfig, setStep, sessionId, flyToken, appName, region, repoUrl, githubToken, addLog, setDeployedUrl, setStep: setAppStep } = useDeployStore();
 
   const handleDeploy = async () => {
     setAppStep('deploying');
@@ -12,7 +12,7 @@ export const ConfigStep = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          sessionId, flyToken, appName, region, repoUrl,
+          sessionId, flyToken, appName, region, repoUrl, githubToken,
           flyToml: generatedConfig?.fly_toml,
           dockerfile: generatedConfig?.dockerfile
         })

@@ -5,6 +5,8 @@ interface DeployState {
   currentStep: 'input' | 'analyzing' | 'config' | 'deploying' | 'success' | 'error';
   repoUrl: string;
   flyToken: string;
+  githubToken: string;
+  preferExistingConfig: boolean;
   appName: string;
   region: string;
   
@@ -30,7 +32,7 @@ interface DeployState {
   error: string | null;
 
   setStep: (step: DeployState['currentStep']) => void;
-  setInputs: (inputs: Partial<Pick<DeployState, 'repoUrl' | 'flyToken' | 'appName' | 'region'>>) => void;
+  setInputs: (inputs: Partial<Pick<DeployState, 'repoUrl' | 'flyToken' | 'appName' | 'region' | 'githubToken' | 'preferExistingConfig'>>) => void;
   setAiConfig: (config: Partial<DeployState['aiConfig']>) => void;
   setSessionId: (id: string) => void;
   setConfig: (config: DeployState['generatedConfig']) => void;
@@ -46,6 +48,8 @@ export const useDeployStore = create<DeployState>()(
       currentStep: 'input',
       repoUrl: '',
       flyToken: '',
+      githubToken: '',
+      preferExistingConfig: false,
       appName: '',
       region: 'iad',
       
@@ -84,6 +88,8 @@ export const useDeployStore = create<DeployState>()(
       partialize: (state) => ({
         repoUrl: state.repoUrl,
         flyToken: state.flyToken,
+        githubToken: state.githubToken,
+        preferExistingConfig: state.preferExistingConfig,
         appName: state.appName,
         region: state.region,
         aiConfig: state.aiConfig

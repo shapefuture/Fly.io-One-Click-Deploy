@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useDeployStore } from '../store/deployStore';
 import { GlassCard } from './GlassCard';
-import { Github, Key, Globe, ArrowRight, Loader2, Info, Bot, Settings2, RefreshCw, Code, Copy, Check } from 'lucide-react';
+import { Github, Key, Globe, ArrowRight, Loader2, Info, Bot, Settings2, RefreshCw, Code, Copy, Check, FileCheck } from 'lucide-react';
 
 const normalizeRepoUrl = (input: string) => {
   const trimmed = input.trim();
@@ -28,7 +28,7 @@ const generateAppNameFromUrl = (url: string) => {
 const BADGE_SVG_URL = "https://raw.githubusercontent.com/shapefuture/bolt.diy/main/flyio-button.svg";
 
 export const InputStep = () => {
-  const { repoUrl, flyToken, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setError } = useDeployStore();
+  const { repoUrl, flyToken, githubToken, preferExistingConfig, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setError } = useDeployStore();
   const [isLoading, setIsLoading] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [showAiSettings, setShowAiSettings] = useState(false);
@@ -134,6 +134,8 @@ export const InputStep = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           repoUrl: finalUrl,
+          githubToken,
+          preferExistingConfig,
           aiConfig: {
             ...aiConfig,
             // Don't send empty strings if not set, let backend handle defaults for Gemini
@@ -264,6 +266,47 @@ export const InputStep = () => {
               />
             </div>
           </div>
+        </div>
+        
+        {/* Advanced Options */}
+        <div className="grid md:grid-cols-1 gap-4">
+             <div className="bg-white/5 p-4 rounded-lg border border-white/5 space-y-4">
+                <div className="flex items-center gap-2 text-sm font-bold text-slate-300">
+                    <Settings2 className="w-4 h-4" /> Repo Access & Preferences
+                </div>
+                
+                <div className="grid md:grid-cols-2 gap-4">
+                     <div>
+                        <label className="block text-xs font-medium text-slate-400 mb-2">GitHub Personal Access Token (Optional)</label>
+                        <input
+                            type="password"
+                            value={githubToken}
+                            onChange={(e) => setInputs({ githubToken: e.target.value })}
+                            placeholder="ghp_... (For private repos)"
+                            className="w-full bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+                        />
+                        <p className="text-[10px] text-slate-500 mt-1">Needed for private repositories or to avoid rate limits.</p>
+                     </div>
+                     
+                     <div className="flex items-center">
+                        <label className="flex items-start gap-3 cursor-pointer group">
+                             <div className={`mt-0.5 w-5 h-5 rounded border border-white/20 flex items-center justify-center transition-colors ${preferExistingConfig ? 'bg-blue-500 border-blue-500' : 'bg-black/40 group-hover:border-white/40'}`}>
+                                 {preferExistingConfig && <Check className="w-3 h-3 text-white" />}
+                             </div>
+                             <input 
+                                type="checkbox" 
+                                className="hidden" 
+                                checked={preferExistingConfig}
+                                onChange={(e) => setInputs({ preferExistingConfig: e.target.checked })}
+                             />
+                             <div className="flex-1">
+                                 <span className="block text-sm text-slate-300 font-medium group-hover:text-white transition-colors">Prefer existing config</span>
+                                 <span className="block text-xs text-slate-500 leading-tight">If a <code>fly.toml</code> exists, use it instead of generating a new one.</span>
+                             </div>
+                        </label>
+                     </div>
+                </div>
+             </div>
         </div>
 
         <div className="grid md:grid-cols-2 gap-6">
