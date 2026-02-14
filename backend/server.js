@@ -9,7 +9,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import simpleGit from 'simple-git';
 import { v4 as uuidv4 } from 'uuid';
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type } from "google-genai";
 import OpenAI from 'openai';
 import { pipeline } from 'stream/promises';
 
@@ -422,7 +422,7 @@ app.post('/api/deploy', async (req, res) => {
             env: { 
                 ...process.env, 
                 FLY_API_TOKEN: flyToken, 
-                NO_COLOR: "1",
+                NO_COLOR: "1", 
                 PATH: envPath 
             },
             all: true
