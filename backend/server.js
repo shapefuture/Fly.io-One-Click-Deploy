@@ -346,6 +346,8 @@ app.post('/api/analyze', async (req, res) => {
             return c.slice(0, 8000);
         })();
 
+        const hasDockerfile = context.includes("Dockerfile:");
+
         // STRICT PROMPT: Enforcing the 'Combined' structure with SINGLE QUOTES
         const prompt = `DevOps Task: Config for Fly.io. Repo: ${repoUrl}. Context: ${context}. Return JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}.
         
@@ -355,6 +357,9 @@ app.post('/api/analyze', async (req, res) => {
         3. Use explicit [[services]] definitions for ports.
         4. Combine robust VM settings (auto_start/stop, shared cpu) with specific service checks.
         5. Ensure [[vm]] section includes BOTH: memory = '1gb' AND memory_mb = 256.
+        6. Dockerfile Strategy:
+           - If a Dockerfile already exists in Context, return null for 'dockerfile' field unless it is clearly broken.
+           - If generating a Dockerfile, MUST use JSON array syntax for CMD. Example: CMD ["/app/binary"]. NEVER use string with brackets like CMD "['/bin']".
         
         Preferred fly.toml Structure:
         app = 'app'
@@ -416,6 +421,12 @@ app.post('/api/analyze', async (req, res) => {
             
             const envVars = {};
             if (json.envVars) json.envVars.forEach(e => envVars[e.name] = e.reason);
+
+            // Double check Dockerfile logic
+            if (hasDockerfile && json.dockerfile) {
+                 // Optionally log that we are overwriting, or choose to ignore AI's dockerfile if trustExisting is logic
+            }
+
             res.json({ success: true, sessionId, ...json, envVars });
 
         } catch (e) {
@@ -456,7 +467,7 @@ primary_region = 'iad'
     timeout = '2s'
     grace_period = '5s'
 `,
-                dockerfile: 'FROM node:18-alpine\nWORKDIR /app\nCOPY . .\nRUN npm ci\nCMD ["npm", "start"]',
+                dockerfile: hasDockerfile ? null : 'FROM node:18-alpine\nWORKDIR /app\nCOPY . .\nRUN npm ci\nCMD ["npm", "start"]',
                 explanation: "Fallback config used (Combined Format).",
                 envVars: {PORT: "8080"}, stack: "Fallback"
             });
@@ -530,6 +541,7 @@ app.post('/api/deploy', async (req, res) => {
                        .replace(/^checks\s*=\s*'.*'/gm, ''); 
             
         await fs.writeFile(tomlPath, tomlContent);
+        // Only write Dockerfile if specifically provided (AI generated one or user edited it)
         if (dockerfile) await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
 
         stream("Registering app...", "info");
