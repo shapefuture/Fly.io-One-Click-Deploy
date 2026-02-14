@@ -1,9 +1,7 @@
 @import "tailwindcss";
 
-@layer utilities {
-  .animate-fade-in-up {
-    animation: fadeInUp 0.5s ease-out forwards;
-  }
+.animate-fade-in-up {
+  animation: fadeInUp 0.5s ease-out forwards;
 }
 
 @keyframes fadeInUp {
