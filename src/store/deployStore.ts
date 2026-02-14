@@ -1,5 +1,5 @@
-
 import { create } from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
 
 interface DeployState {
   currentStep: 'input' | 'analyzing' | 'config' | 'deploying' | 'success' | 'error';
@@ -40,39 +40,54 @@ interface DeployState {
   reset: () => void;
 }
 
-export const useDeployStore = create<DeployState>((set) => ({
-  currentStep: 'input',
-  repoUrl: '',
-  flyToken: '',
-  appName: '',
-  region: 'iad',
-  
-  aiConfig: {
-    provider: 'gemini',
-    apiKey: '',
-    model: ''
-  },
+export const useDeployStore = create<DeployState>()(
+  persist(
+    (set) => ({
+      currentStep: 'input',
+      repoUrl: '',
+      flyToken: '',
+      appName: '',
+      region: 'iad',
+      
+      aiConfig: {
+        provider: 'gemini',
+        apiKey: '',
+        model: ''
+      },
 
-  sessionId: null,
-  generatedConfig: null,
-  logs: [],
-  deployedUrl: null,
-  error: null,
+      sessionId: null,
+      generatedConfig: null,
+      logs: [],
+      deployedUrl: null,
+      error: null,
 
-  setStep: (step) => set({ currentStep: step }),
-  setInputs: (inputs) => set((state) => ({ ...state, ...inputs })),
-  setAiConfig: (config) => set((state) => ({ aiConfig: { ...state.aiConfig, ...config } })),
-  setSessionId: (id) => set({ sessionId: id }),
-  setConfig: (config) => set({ generatedConfig: config }),
-  addLog: (log) => set((state) => ({ logs: [...state.logs, { ...log, type: log.type as any }] })),
-  setDeployedUrl: (url) => set({ deployedUrl: url }),
-  setError: (error) => set({ error, currentStep: 'error' }),
-  reset: () => set({
-    currentStep: 'input',
-    sessionId: null,
-    generatedConfig: null,
-    logs: [],
-    deployedUrl: null,
-    error: null
-  })
-}));
+      setStep: (step) => set({ currentStep: step }),
+      setInputs: (inputs) => set((state) => ({ ...state, ...inputs })),
+      setAiConfig: (config) => set((state) => ({ aiConfig: { ...state.aiConfig, ...config } })),
+      setSessionId: (id) => set({ sessionId: id }),
+      setConfig: (config) => set({ generatedConfig: config }),
+      addLog: (log) => set((state) => ({ logs: [...state.logs, { ...log, type: log.type as any }] })),
+      setDeployedUrl: (url) => set({ deployedUrl: url }),
+      setError: (error) => set({ error, currentStep: 'error' }),
+      reset: () => set({
+        currentStep: 'input',
+        sessionId: null,
+        generatedConfig: null,
+        logs: [],
+        deployedUrl: null,
+        error: null
+      })
+    }),
+    {
+      name: 'deploy-storage',
+      storage: createJSONStorage(() => localStorage),
+      partialize: (state) => ({
+        repoUrl: state.repoUrl,
+        flyToken: state.flyToken,
+        appName: state.appName,
+        region: state.region,
+        aiConfig: state.aiConfig
+      }),
+    }
+  )
+);
