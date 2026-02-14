@@ -121,6 +121,14 @@ export const InputStep = () => {
 
     setIsLoading(true);
     try {
+      // Diagnostic Health Check
+      try {
+        const healthRes = await fetch('/api/health');
+        if (!healthRes.ok) throw new Error("Backend unhealthy");
+      } catch (e) {
+        throw new Error("Backend server is not reachable. Is the local server running on port 3000?");
+      }
+
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

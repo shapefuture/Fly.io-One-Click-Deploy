@@ -144,6 +144,11 @@ function cleanJson(text) {
 
 // --- Routes ---
 
+// Health Check Endpoint
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', uptime: process.uptime() });
+});
+
 app.post('/api/analyze', async (req, res) => {
     const { repoUrl, aiConfig } = req.body;
     if (!repoUrl) return res.status(400).json({ error: 'Repo URL is required' });
@@ -394,4 +399,4 @@ if (process.env.NODE_ENV === 'production') {
     app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../dist/index.html')));
 }
 
-app.listen(port, () => console.log(`🚀 Backend running on port ${port}`));
+app.listen(port, '0.0.0.0', () => console.log(`🚀 Backend running on port ${port}`));
