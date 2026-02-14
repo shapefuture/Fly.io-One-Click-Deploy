@@ -43,7 +43,7 @@ const checkBackendHealth = async (retries = 3, delay = 1000): Promise<boolean> =
 };
 
 export const InputStep = () => {
-  const { repoUrl, flyToken, githubToken, preferExistingConfig, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setError, deployApp } = useDeployStore();
+  const { repoUrl, flyToken, githubToken, preferExistingConfig, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setSecrets, setError, deployApp } = useDeployStore();
   const [isLoading, setIsLoading] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [showAiSettings, setShowAiSettings] = useState(false);
@@ -178,14 +178,21 @@ export const InputStep = () => {
         stack: data.stack || 'Unknown',
         healthCheckPath: data.healthCheckPath,
         sources: data.sources || [],
-        files: data.files || [] // FIXED: Ensure files are passed to store
+        files: data.files || []
       });
+
+      // Initialize Secrets from EnvVars detected
+      const initialSecrets: Record<string, string> = {};
+      if (data.envVars) {
+          Object.keys(data.envVars).forEach(key => {
+              initialSecrets[key] = "";
+          });
+      }
+      setSecrets(initialSecrets);
 
       // SHORT CIRCUIT: Auto-deploy if using existing config
       if (preferExistingConfig) {
-          // Trigger deployment immediately
           await deployApp();
-          // State is handled inside deployApp (sets step to 'deploying')
       } else {
           setStep('config');
       }
@@ -434,7 +441,7 @@ export const InputStep = () => {
                                     ))}
                                 </select>
                                 <input 
-                                    type="text"
+                                    type="text" 
                                     value={aiConfig.model}
                                     onChange={(e) => setAiConfig({ model: e.target.value })}
                                     placeholder="Or type custom model ID..."

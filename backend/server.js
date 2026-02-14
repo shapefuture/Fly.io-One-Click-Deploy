@@ -3,35 +3,22 @@ import { execa } from 'execa';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import fs from 'fs/promises';
-import { createWriteStream, existsSync } from 'fs';
+import { existsSync } from 'fs';
 import path from 'path';
-import os from 'os';
-import { fileURLToPath } from 'url';
 import { v4 as uuidv4 } from 'uuid';
-import { GoogleGenAI, Type } from "@google/genai";
-import OpenAI from 'openai';
-import { createRequire } from 'module';
-import { pipeline } from 'stream/promises';
 
-const require = createRequire(import.meta.url);
-const AdmZip = require('adm-zip');
-
-let tar;
-try {
-    tar = require('tar');
-} catch (e) {
-    console.warn("⚠️ Warning: 'tar' npm package is missing. Fallback to system tar will be used.");
-}
+import { TEMP_DIR, VERCEL_HOME, FLY_INSTALL_DIR, IS_VERCEL, IS_WINDOWS } from './lib/config.js';
+import { getFlyExe, getFlyInstallState } from './lib/installer.js';
+import { downloadRepo } from './lib/git.js';
+import { StackDetector } from './lib/stack-detector.js';
+import { PolicyEngine } from './lib/policy.js';
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// --- GLOBAL ERROR HANDLERS (CRASH GUARD) ---
+// --- GLOBAL ERROR HANDLERS ---
 process.on('uncaughtException', (err) => {
     console.error('🔥 UNCAUGHT EXCEPTION:', err);
 });
@@ -40,35 +27,17 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('🔥 UNHANDLED REJECTION:', reason);
 });
 
-// --- ENVIRONMENT DETECTION ---
-const IS_VERCEL = process.env.VERCEL === '1' || !!process.env.NOW_REGION || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
-const IS_WINDOWS = os.platform() === 'win32';
-const BIN_NAME = IS_WINDOWS ? 'flyctl.exe' : 'flyctl';
-
-// --- PATH CONFIGURATION ---
-const BASE_WORK_DIR = IS_VERCEL ? os.tmpdir() : __dirname;
-const VERCEL_HOME = path.join(os.tmpdir(), 'fly_home');
-const TEMP_DIR = path.join(BASE_WORK_DIR, 'fly_deployer_workspaces');
-const FLY_INSTALL_DIR = path.join(VERCEL_HOME, '.fly');
-const FLY_BIN = path.join(FLY_INSTALL_DIR, 'bin', BIN_NAME);
-
-// Global locks
-let flyBinPath = null;
-let installationPromise = null;
-let lastInstallError = null;
-
 app.use(cors());
 app.use(express.json());
 
 // --- INITIALIZATION ---
-
 async function ensureDirs() {
     try {
         await fs.mkdir(TEMP_DIR, { recursive: true });
         await fs.mkdir(VERCEL_HOME, { recursive: true });
         await fs.mkdir(FLY_INSTALL_DIR, { recursive: true });
-        await fs.mkdir(path.dirname(FLY_BIN), { recursive: true });
         
+        // Cleanup old workspaces
         if (!IS_VERCEL) {
             const files = await fs.readdir(TEMP_DIR);
             const now = Date.now();
@@ -85,147 +54,7 @@ async function ensureDirs() {
     }
 }
 
-/**
- * NUCLEAR INSTALLER v3 (Vercel-Optimized)
- */
-async function performAntifragileInstallation() {
-    const log = (msg) => console.log(`[FlyInstaller] ${msg}`);
-    const warn = (msg) => console.warn(`[FlyInstaller] ${msg}`);
-
-    const CHILD_ENV = {
-        ...process.env,
-        HOME: VERCEL_HOME,
-        FLYCTL_INSTALL: FLY_INSTALL_DIR,
-        PATH: `${process.env.PATH}${path.delimiter}/bin${path.delimiter}/usr/bin${path.delimiter}/usr/local/bin`
-    };
-
-    const verify = async (p) => {
-        try {
-            if (!p || !existsSync(p)) return false;
-            if (!IS_WINDOWS) await fs.chmod(p, 0o755).catch(() => {});
-            const { stdout } = await execa(p, ['version'], { 
-                env: CHILD_ENV,
-                timeout: 5000 
-            });
-            return stdout.includes('flyctl');
-        } catch (e) { 
-            return false; 
-        }
-    };
-
-    if (await verify('flyctl')) return 'flyctl';
-    if (await verify(FLY_BIN)) return FLY_BIN;
-    
-    const homeFly = path.join(os.homedir(), '.fly', 'bin', BIN_NAME);
-    if (!IS_VERCEL && await verify(homeFly)) return homeFly;
-
-    log(`Starting installation to ${FLY_BIN}...`);
-    const binDir = path.dirname(FLY_BIN);
-
-    // Strategy 1: Shell
-    if (!IS_WINDOWS) {
-        try {
-            log("Strategy 1: curl | sh");
-            await execa('sh', ['-c', 'curl -L https://fly.io/install.sh | sh'], {
-                env: CHILD_ENV,
-                timeout: 45000
-            });
-            if (await verify(FLY_BIN)) return FLY_BIN;
-        } catch (e) { }
-
-        try {
-            log("Strategy 1b: wget | sh");
-            await execa('sh', ['-c', 'wget -qO- https://fly.io/install.sh | sh'], {
-                env: CHILD_ENV,
-                timeout: 45000
-            });
-            if (await verify(FLY_BIN)) return FLY_BIN;
-        } catch (e) { }
-    }
-
-    // Strategy 2: Direct Download
-    log("Strategy 2: Direct Download Matrix");
-    try {
-        const platform = os.platform();
-        const arch = os.arch();
-        let osName = platform === 'darwin' ? 'macOS' : platform === 'win32' ? 'Windows' : 'Linux';
-        let archName = (arch === 'arm64') ? 'arm64' : (arch === 'x64' ? 'x86_64' : arch);
-
-        let versionsToTry = [];
-        try {
-            const releaseRes = await fetch('https://api.github.com/repos/superfly/flyctl/releases/latest');
-            if (releaseRes.ok) {
-                const releaseData = await releaseRes.json();
-                versionsToTry.push(releaseData.tag_name.replace(/^v/, ''));
-            }
-        } catch (e) { warn("GitHub API failed, skipping latest version check."); }
-
-        versionsToTry.push("0.4.11");
-        versionsToTry.push("0.2.22");
-        versionsToTry = [...new Set(versionsToTry)];
-
-        const fileExts = platform === 'win32' ? ['.zip'] : ['.tar.gz'];
-        
-        for (const version of versionsToTry) {
-            log(`Attempting version: v${version}`);
-            for (const ext of fileExts) {
-                const fileName = `flyctl_${version}_${osName}_${archName}${ext}`;
-                const url = `https://github.com/superfly/flyctl/releases/download/v${version}/${fileName}`;
-                
-                try {
-                    const tmpPath = path.join(VERCEL_HOME, `fly_dl_${uuidv4()}${ext}`);
-                    const response = await fetch(url);
-                    if (!response.ok) continue;
-
-                    const fileStream = createWriteStream(tmpPath);
-                    await pipeline(response.body, fileStream);
-
-                    if (ext === '.zip') {
-                        new AdmZip(tmpPath).extractAllTo(binDir, true);
-                    } else {
-                        if (tar) await tar.x({ file: tmpPath, cwd: binDir });
-                        else await execa('tar', ['-xzf', tmpPath, '-C', binDir], { env: CHILD_ENV });
-                    }
-                    await fs.unlink(tmpPath).catch(() => {});
-
-                    const walk = async (dir) => {
-                        const list = await fs.readdir(dir, { withFileTypes: true });
-                        for (const item of list) {
-                            const itemPath = path.join(dir, item.name);
-                            if (item.isDirectory()) {
-                                if (await walk(itemPath)) return true;
-                            } else if (item.name === BIN_NAME) {
-                                if (itemPath !== FLY_BIN) await fs.rename(itemPath, FLY_BIN).catch(() => {});
-                                if (!IS_WINDOWS) await fs.chmod(FLY_BIN, 0o755).catch(() => {});
-                                return true;
-                            }
-                        }
-                        return false;
-                    };
-                    
-                    if (await walk(binDir)) {
-                         if (await verify(FLY_BIN)) {
-                             log(`✅ Successfully installed v${version}`);
-                             return FLY_BIN;
-                         }
-                    }
-                } catch (dlErr) { }
-            }
-        }
-    } catch (e) { warn(`Strategy 2 Matrix failed: ${e.message}`); }
-    throw new Error(`Installation failed.`);
-}
-
-async function getFlyExe() {
-    if (flyBinPath && existsSync(flyBinPath)) return flyBinPath;
-    if (!installationPromise) {
-        installationPromise = performAntifragileInstallation()
-            .then(p => { flyBinPath = p; installationPromise = null; return p; })
-            .catch(e => { lastInstallError = e.message; installationPromise = null; throw e; });
-    }
-    return installationPromise;
-}
-
+// Background install
 (async () => {
     await ensureDirs();
     if (!IS_VERCEL) getFlyExe().catch(() => {});
@@ -237,29 +66,16 @@ async function cleanup(dir) {
     }
 }
 
-async function downloadRepo(repoUrl, targetDir, githubToken) {
-    const cleanUrl = repoUrl.replace(/\.git$/, '').replace(/\/$/, '');
-    const archiveUrl = `${cleanUrl}/archive/HEAD.zip`;
-    const headers = githubToken ? { 'Authorization': `token ${githubToken}` } : {};
-
-    const res = await fetch(archiveUrl, { headers });
-    if (!res.ok) throw new Error(`Repo download failed: ${res.status}`);
-    
-    const zip = new AdmZip(Buffer.from(await res.arrayBuffer()));
-    zip.extractAllTo(targetDir, true);
-    
-    const list = await fs.readdir(targetDir);
-    const root = list.find(n => !n.startsWith('.'));
-    if (root && (await fs.stat(path.join(targetDir, root))).isDirectory()) {
-        return path.join(targetDir, root);
-    }
-    return targetDir;
-}
-
 // --- API ROUTES ---
 
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime(), env: IS_VERCEL ? 'vercel' : 'node', flyInstalled: !!flyBinPath });
+    const installState = getFlyInstallState();
+    res.json({ 
+        status: 'ok', 
+        uptime: process.uptime(), 
+        env: IS_VERCEL ? 'vercel' : 'node', 
+        flyInstalled: installState.installed 
+    });
 });
 
 app.post('/api/analyze', async (req, res) => {
@@ -269,194 +85,56 @@ app.post('/api/analyze', async (req, res) => {
     await fs.mkdir(workDir, { recursive: true }).catch(() => {});
 
     try {
-        if (preferExistingConfig) {
-            return res.json({
-                success: true, sessionId,
-                fly_toml: "# Existing config", dockerfile: null,
-                explanation: "Using existing config", envVars: {}, stack: "Existing", files: []
-            });
-        }
-
+        // 1. Download Repo
         let repoPath = workDir;
         try { repoPath = await downloadRepo(repoUrl, workDir, githubToken); } catch (e) { }
 
-        const context = await (async () => {
-            if (repoPath === workDir) return "No code available.";
-            const files = ['package.json', 'fly.toml', 'Dockerfile', 'requirements.txt', 'go.mod'];
-            let c = "";
-            for (const f of files) {
-                try { c += `\n${f}:\n` + await fs.readFile(path.join(repoPath, f), 'utf8'); } catch {}
-            }
-            return c.slice(8000);
-        })();
+        // 2. Detect Strategy
+        const strategy = StackDetector.detect(repoPath, repoUrl);
+        console.log(`[Analysis] Selected Strategy: ${strategy.name} for ${repoUrl}`);
 
-        const hasDockerfile = context.includes("Dockerfile:");
+        // 3. Execute Strategy
+        const result = await strategy.analyze(repoPath, repoUrl, appName, aiConfig, preferExistingConfig);
 
-        const prompt = `DevOps Task: Config for Fly.io. Repo: ${repoUrl}. Context: ${context}. Return JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}.
-        CRITICAL RULES:
-        1. fly.toml strings MUST use SINGLE QUOTES.
-        2. [[vm]] section MUST include BOTH: memory = '1gb' AND memory_mb = 256.
-        3. If Dockerfile exists, set 'dockerfile' to null.
-        4. If generating Dockerfile, use JSON array syntax for CMD.
-        5. Detect 'internal_port' (8080, 3000, 80).
-        6. Sniproxy crash fix: override PUBLIC_IP vars.
-        7. PREVENT IDLE STOP: Set auto_stop_machines = false and min_machines_running = 1.
-        
-        Preferred Structure:
-        app = '${appName || 'name'}'
-        primary_region = 'iad'
-        [http_service]
-          internal_port = 8080
-          force_https = true
-          auto_stop_machines = false
-          auto_start_machines = true
-          min_machines_running = 1
-        [[vm]]
-        memory = '1gb'
-        cpu_kind = 'shared'
-        cpus = 1
-        memory_mb = 256
-        [[services.ports]]
-            port = 443
-            handlers = ['tls', 'http']
-        `;
-
-        try {
-            const provider = aiConfig?.provider || 'gemini';
-            let json;
-
-            if (provider === 'openrouter') {
-                const openai = new OpenAI({ baseURL: 'https://openrouter.ai/api/v1', apiKey: aiConfig.apiKey });
-                const completion = await openai.chat.completions.create({
-                    model: aiConfig.model || 'google/gemini-2.0-flash-exp:free',
-                    messages: [{ role: 'system', content: 'JSON only.' }, { role: 'user', content: prompt }],
-                    response_format: { type: 'json_object' }
-                });
-                json = JSON.parse(completion.choices[0].message.content);
-            } else {
-                const apiKey = aiConfig?.apiKey || process.env.API_KEY;
-                const ai = new GoogleGenAI({ apiKey });
-                const result = await ai.models.generateContent({
-                    model: aiConfig?.model || 'gemini-3-flash-preview',
-                    contents: prompt,
-                    config: { responseMimeType: "application/json" }
-                });
-                json = JSON.parse(result.text);
+        // 4. Global Post-Processing (The "Healer" - Policy Engine)
+        if (result.fly_toml) {
+            if (appName) {
+                if (/^app\s*=/m.test(result.fly_toml)) {
+                    result.fly_toml = result.fly_toml.replace(/^app\s*=.*$/m, `app = '${appName}'`);
+                } else {
+                    result.fly_toml = `app = '${appName}'\n` + result.fly_toml;
+                }
             }
             
-            if (hasDockerfile) json.dockerfile = null;
-
-            // --- FORCE APP NAME & PREVENT IDLE STOP ---
-            if (json.fly_toml) {
-                if (appName) {
-                    if (/^app\s*=/m.test(json.fly_toml)) {
-                        json.fly_toml = json.fly_toml.replace(/^app\s*=.*$/m, `app = '${appName}'`);
-                    } else {
-                        json.fly_toml = `app = '${appName}'\n` + json.fly_toml;
-                    }
-                }
-                
-                // Enforce persistence logic: if auto_stop_machines is true, force to false
-                json.fly_toml = json.fly_toml.replace(/auto_stop_machines\s*=\s*true/g, "auto_stop_machines = false");
-                json.fly_toml = json.fly_toml.replace(/min_machines_running\s*=\s*0/g, "min_machines_running = 1");
-                
-                // If it doesn't exist, we might rely on the [http_service] being present or user will check it.
-                // The AI prompt encourages [http_service] with correct values.
-            }
-
-            // --- SAFETY NET FOR SNIPROXY ---
-            if (repoUrl.toLowerCase().includes('sniproxy')) {
-                console.log("🛡️ Applying Sniproxy Max Fallback Safety Net");
-                
-                if (json.fly_toml) {
-                    json.fly_toml = json.fly_toml.replace(/type = 'http'/g, "type = 'tcp'")
-                        .replace(/path = '.*'/g, "# path removed")
-                        .replace(/handlers = \['http'\]/g, "handlers = []");
-                }
-
-                const safetyVars = {
-                    "SNIPROXY_GENERAL__PUBLIC_IPV4": "127.0.0.1",
-                    "SNIPROXY_GENERAL__PUBLIC_IPV6": "::1",
-                    "SNIPROXY_GENERAL__BIND_HTTP": "0.0.0.0:80",
-                    "SNIPROXY_GENERAL__BIND_HTTPS": "0.0.0.0:443",
-                    "GOMAXPROCS": "1"
-                };
-
-                if (json.fly_toml) {
-                     const keys = Object.keys(safetyVars).concat(["PUBLIC_IPV4", "BIND_HTTP"]);
-                     keys.forEach(key => {
-                         json.fly_toml = json.fly_toml.replace(new RegExp(`^\\s*${key}\\s*=.*$`, 'gm'), '');
-                     });
-                     const envContent = Object.entries(safetyVars).map(([k, v]) => `  ${k} = '${v}'`).join('\n');
-                     if (/^\s*\[env\]/m.test(json.fly_toml)) {
-                        json.fly_toml = json.fly_toml.replace(/(\[env\])/, `$1\n${envContent}`);
-                     } else {
-                        json.fly_toml += `\n[env]\n${envContent}\n`;
-                    }
-                }
-
-                if (!json.envVars) json.envVars = [];
-                Object.entries(safetyVars).forEach(([k, v]) => {
-                    if (!json.envVars.find(e => e.name === k)) json.envVars.push({ name: k, reason: "Crash Prevention" });
-                });
-
-                // FIXED: Config now uses valid URI scheme for DNS
-                const sniproxyConfig = `general:
-  upstream_dns: "udp://1.1.1.1:53"
-  upstream_dns_over_socks5: false
-  bind_dns_over_udp: "0.0.0.0:53"
-  bind_http: "0.0.0.0:80"
-  bind_https: "0.0.0.0:443"
-  public_ipv4: "127.0.0.1"
-  public_ipv6: "::1"
-  allow_conn_to_local: false
-  log_level: info
-
-acl:
-  geoip:
-    enabled: false
-  domain:
-    enabled: false
-  cidr:
-    enabled: false
-`;
-                json.files = [
-                    { name: "config.yaml", content: sniproxyConfig },
-                    { name: "sniproxy/cmd/sniproxy/config.defaults.yaml", content: sniproxyConfig }
-                ];
-
-                json.dockerfile = `FROM golang:alpine AS builder
-WORKDIR /app
-RUN apk add --no-cache git
-COPY . .
-COPY config.yaml /config.yaml
-RUN if [ -d "./cmd/sniproxy" ]; then go build -ldflags "-s -w" -o /sniproxy ./cmd/sniproxy; else go build -ldflags "-s -w" -o /sniproxy .; fi
-FROM alpine:latest
-RUN apk add --no-cache ca-certificates
-COPY --from=builder /sniproxy /sniproxy
-COPY config.yaml /config.yaml
-ENTRYPOINT ["/sniproxy", "-c", "/config.yaml"]
-`;
-                json.explanation = (json.explanation || "") + " [System] Applied Max Fallback: Validated DNS URI scheme.";
-            }
-
-            const envVars = {};
-            if (Array.isArray(json.envVars)) json.envVars.forEach(e => envVars[e.name] = e.reason);
-            else if (json.envVars) Object.entries(json.envVars).forEach(([k, v]) => envVars[k] = v);
-
-            res.json({ success: true, sessionId, ...json, envVars });
-
-        } catch (e) {
-            console.error("AI Error:", e);
-            res.json({ success: true, sessionId, fly_toml: `app='app'`, dockerfile: null, explanation: "Error", envVars: {}, stack: "Error", files: [] });
+            // Enforce Persistence Policy
+            result.fly_toml = result.fly_toml.replace(/auto_stop_machines\s*=\s*true/g, "auto_stop_machines = false");
+            result.fly_toml = result.fly_toml.replace(/min_machines_running\s*=\s*0/g, "min_machines_running = 1");
         }
+
+        const envVars = {};
+        if (Array.isArray(result.envVars)) result.envVars.forEach(e => envVars[e.name] = e.reason);
+        else if (result.envVars) Object.entries(result.envVars).forEach(([k, v]) => envVars[k] = v);
+
+        res.json({ 
+            success: true, 
+            sessionId, 
+            fly_toml: result.fly_toml,
+            dockerfile: result.dockerfile,
+            explanation: result.explanation,
+            files: result.files || [],
+            stack: result.stack,
+            healthCheckPath: result.healthCheckPath,
+            envVars 
+        });
+
     } catch (e) {
+        console.error("Analysis Failed:", e);
         res.status(500).json({ error: e.message });
     }
 });
 
 app.post('/api/deploy', async (req, res) => {
-    const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl, githubToken, preferExistingConfig, files } = req.body;
+    const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl, githubToken, preferExistingConfig, files, secrets, healthCheckPath } = req.body;
     
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Connection', 'keep-alive');
@@ -480,6 +158,14 @@ app.post('/api/deploy', async (req, res) => {
             FLY_NO_UPDATE_CHECK: "1",
             FLY_CHECK_UPDATE: "false"
         };
+
+        // --- PHASE 4: PRE-FLIGHT CHECKS ---
+        stream("🕵️ Verifying credentials...", "info");
+        try {
+            await execa(flyExe, ['orgs', 'list'], { env: DEPLOY_ENV, timeout: 5000 });
+        } catch (e) {
+            throw new Error("Invalid Fly.io Token or Permissions. Please check your token and try again.");
+        }
 
         let targetDir = workDir;
         try {
@@ -518,39 +204,14 @@ app.post('/api/deploy', async (req, res) => {
             await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
         }
 
-        // Write Extra Files with HOT PATCHING
+        // Write Extra Files
         if (files && Array.isArray(files)) {
             for (const f of files) {
                 const filePath = path.join(targetDir, f.name);
                 await fs.mkdir(path.dirname(filePath), { recursive: true });
-                
-                // --- ANTIFRAGILE HOT-PATCH ---
-                // If the frontend passed a config with the old broken "1.1.1.1" URI, fix it here instantly.
-                let content = f.content;
-                if (f.name.endsWith('yaml') || f.name.endsWith('yml')) {
-                    // Replace standalone IP with udp:// scheme
-                    content = content.replace(/upstream_dns:\s*"(\d+\.\d+\.\d+\.\d+)"/g, 'upstream_dns: "udp://$1:53"');
-                }
-                
-                await fs.writeFile(filePath, content);
-                stream(`Generated ${f.name} (Patched)`, 'info');
+                await fs.writeFile(filePath, f.content);
+                stream(`Generated ${f.name}`, 'info');
             }
-        }
-
-        // --- JUST-IN-TIME HEALER ---
-        if (dockerfile && dockerfile.includes('COPY config.yaml')) {
-             const configPath = path.join(targetDir, 'config.yaml');
-             if (!existsSync(configPath)) {
-                 stream("⚠️  Healer: Missing config.yaml detected. Regenerating...", "warning");
-                 const emergencyConfig = `general:
-  upstream_dns: "udp://1.1.1.1:53"
-  bind_http: "0.0.0.0:80"
-  bind_https: "0.0.0.0:443"
-  public_ipv4: "127.0.0.1"
-  log_level: info`;
-                 await fs.writeFile(configPath, emergencyConfig);
-                 stream("✅ Healer: Emergency config.yaml injected.", "success");
-             }
         }
 
         stream("🛡️ Sanitizing Build Context...", "info");
@@ -565,6 +226,9 @@ dist
             `.trim());
         } catch (e) { }
 
+        // --- POLICY ENGINE EXECUTION ---
+        await PolicyEngine.apply(targetDir, appName, region, stream);
+
         stream("Registering app...", "info");
         try {
             const createProc = execa(flyExe, ['apps', 'create', appName], { env: DEPLOY_ENV });
@@ -575,6 +239,63 @@ dist
             if (err.includes('taken') || err.includes('exists')) stream("App exists, updating...", "warning");
         }
         
+        // --- PHASE 2: VOLUME PROVISIONING ---
+        // Parse fly.toml for [mounts] to auto-provision volumes
+        try {
+            const mountsMatch = tomlContent.match(/\[mounts\][\s\S]*?source\s*=\s*['"]?([^'"\s]+)['"]?/);
+            if (mountsMatch && mountsMatch[1]) {
+                const volName = mountsMatch[1];
+                stream(`📦 Detected Volume Request: '${volName}'`, 'info');
+                
+                // Check if volume exists
+                let volExists = false;
+                try {
+                    const listProc = await execa(flyExe, ['volumes', 'list', '--json', '--app', appName], { env: DEPLOY_ENV });
+                    const vols = JSON.parse(listProc.stdout);
+                    if (vols.find(v => v.Name === volName)) volExists = true;
+                } catch (e) { /* ignore list error (app might be new) */ }
+
+                if (!volExists) {
+                    stream(`🛠️ Creating Volume '${volName}' in ${region}...`, 'info');
+                    try {
+                        await execa(flyExe, [
+                            'volumes', 'create', volName,
+                            '--region', region,
+                            '--size', '1',
+                            '--no-encryption',
+                            '--app', appName,
+                            '--yes'
+                        ], { env: DEPLOY_ENV });
+                        stream(`✅ Volume '${volName}' created successfully.`, 'success');
+                    } catch (e) {
+                        stream(`⚠️ Failed to create volume: ${e.message}. Deployment might fail if volume is missing.`, 'warning');
+                    }
+                } else {
+                    stream(`✅ Volume '${volName}' already exists.`, 'info');
+                }
+            }
+        } catch (e) {
+            stream(`⚠️ Volume detection failed: ${e.message}`, 'warning');
+        }
+
+        // --- PHASE 3: SECRETS MANAGEMENT ---
+        if (secrets && Object.keys(secrets).length > 0) {
+            stream("🔐 Configuring secrets...", "info");
+            try {
+                // Filter out empty keys/values
+                const secretArgs = Object.entries(secrets)
+                    .filter(([k, v]) => k && v)
+                    .map(([k, v]) => `${k}=${v}`);
+
+                if (secretArgs.length > 0) {
+                    await execa(flyExe, ['secrets', 'set', ...secretArgs, '--app', appName], { env: DEPLOY_ENV });
+                    stream(`✅ Set ${secretArgs.length} secret(s) successfully.`, 'success');
+                }
+            } catch (e) {
+                stream(`⚠️ Failed to set secrets: ${e.message}`, 'warning');
+            }
+        }
+
         await new Promise(r => setTimeout(r, 2000));
 
         stream("Deploying...", "log");
@@ -590,6 +311,35 @@ dist
 
         const statusProc = await execa(flyExe, ['status', '--json'], { env: DEPLOY_ENV, cwd: targetDir });
         const status = JSON.parse(statusProc.stdout);
+        const hostname = status.Hostname;
+
+        // --- PHASE 4: HEALTH VERIFICATION ---
+        if (hostname) {
+             const checkPath = healthCheckPath || '/';
+             const url = `https://${hostname}${checkPath}`;
+             stream(`💓 Verifying deployment health at ${url}...`, 'info');
+             
+             let healthy = false;
+             for (let i = 0; i < 5; i++) { // Try for ~25 seconds (5 * 5s)
+                 try {
+                     const healthRes = await fetch(url);
+                     if (healthRes.ok) {
+                         healthy = true;
+                         stream(`✅ Health check passed (${healthRes.status})`, 'success');
+                         break;
+                     } else {
+                         stream(`Health check pending (${healthRes.status})...`, 'log');
+                     }
+                 } catch (e) {
+                     stream(`Waiting for DNS propagation...`, 'log');
+                 }
+                 await new Promise(r => setTimeout(r, 5000));
+             }
+             
+             if (!healthy) {
+                 stream(`⚠️ App deployed, but health check failed at ${url}. It might just need more time to boot.`, 'warning');
+             }
+        }
         
         res.write(`data: ${JSON.stringify({ type: 'success', appUrl: `https://${status.Hostname}`, appName: status.Name })}\n\n`);
 

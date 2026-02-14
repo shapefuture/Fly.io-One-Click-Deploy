@@ -28,6 +28,9 @@ interface DeployState {
     sources: Array<{ title: string; uri: string }>;
     files?: Array<{ name: string; content: string }>;
   } | null;
+  
+  secrets: Record<string, string>; // Runtime secrets (KEY=VALUE)
+
   logs: Array<{ message: string; type: 'info' | 'log' | 'error' | 'success' | 'warning' }>;
   deployedUrl: string | null;
   error: string | null;
@@ -37,6 +40,7 @@ interface DeployState {
   setAiConfig: (config: Partial<DeployState['aiConfig']>) => void;
   setSessionId: (id: string) => void;
   setConfig: (config: DeployState['generatedConfig']) => void;
+  setSecrets: (secrets: Record<string, string>) => void;
   addLog: (log: { message: string; type: string }) => void;
   setDeployedUrl: (url: string) => void;
   setError: (error: string) => void;
@@ -64,6 +68,7 @@ export const useDeployStore = create<DeployState>()(
 
       sessionId: null,
       generatedConfig: null,
+      secrets: {},
       logs: [],
       deployedUrl: null,
       error: null,
@@ -73,6 +78,7 @@ export const useDeployStore = create<DeployState>()(
       setAiConfig: (config) => set((state) => ({ aiConfig: { ...state.aiConfig, ...config } })),
       setSessionId: (id) => set({ sessionId: id }),
       setConfig: (config) => set({ generatedConfig: config }),
+      setSecrets: (secrets) => set({ secrets }),
       addLog: (log) => set((state) => ({ logs: [...state.logs, { ...log, type: log.type as any }] })),
       setDeployedUrl: (url) => set({ deployedUrl: url }),
       setError: (error) => set({ error, currentStep: 'error' }),
@@ -80,13 +86,14 @@ export const useDeployStore = create<DeployState>()(
         currentStep: 'input',
         sessionId: null,
         generatedConfig: null,
+        secrets: {},
         logs: [],
         deployedUrl: null,
         error: null
       }),
 
       deployApp: async () => {
-        const { sessionId, flyToken, appName, region, repoUrl, githubToken, preferExistingConfig, generatedConfig } = get();
+        const { sessionId, flyToken, appName, region, repoUrl, githubToken, preferExistingConfig, generatedConfig, secrets } = get();
         
         set({ currentStep: 'deploying', error: null, logs: [], deployedUrl: null });
 
@@ -101,7 +108,9 @@ export const useDeployStore = create<DeployState>()(
               sessionId, flyToken, appName, region, repoUrl, githubToken, preferExistingConfig,
               flyToml: generatedConfig?.fly_toml,
               dockerfile: generatedConfig?.dockerfile,
-              files: generatedConfig?.files
+              files: generatedConfig?.files,
+              secrets, // Send secrets to backend
+              healthCheckPath: generatedConfig?.healthCheckPath
             })
           });
 

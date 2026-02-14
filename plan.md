@@ -63,15 +63,12 @@ To be universal, the system must transition from **Hardcoded Logic** to **Declar
 
 ## 4. Strategic Execution Roadmap
 
-| Step | Action | Impact |
-| :--- | :--- | :--- |
-| **1** | **Lib Extraction** | Move `installer.js` and `git.js` out of `server.js` to enable unit testing of the core primitives. |
-| **2** | **Preset Migration** | Move "Sniproxy" and "Static" logic into external JSON/JS presets. |
-| **3** | **Refined AI Prompting** | Update Gemini prompts to use `Type.OBJECT` schemas for analysis, removing the need for manual JSON parsing and regex fixes. |
-| **4** | **Secrets UI** | Add a dynamic key-value editor to the `ConfigStep` for runtime secrets. |
-| **5** | **Pre-flight Checks** | Add a phase to verify token permissions and "Organization" status before starting the remote build. |
-
-## 5. Critical Constraints & Safety
-- **Anti-Dumbing Down**: We will NOT remove the "Healer" logic; we will transform it into a generic "Policy Engine."
-- **Integrity**: Every AI-generated Dockerfile must be validated against the detected stack's base-image standards.
-- **Audit**: Every command executed (`flyctl ...`) must be logged with its full environment context for forensic analysis in case of a 5xx failure.
+| Step | Action | Impact | Status |
+| :--- | :--- | :--- | :--- |
+| **1** | **Lib Extraction** | Move `installer.js` and `git.js` out of `server.js` to enable unit testing of the core primitives. | [X] |
+| **2** | **Preset Migration** | Move "Sniproxy" and "Static" logic into external JSON/JS presets. | [X] |
+| **3** | **Refined AI Prompting** | Update Gemini prompts to use `Type.OBJECT` schemas for analysis, removing the need for manual JSON parsing and regex fixes. | [X] |
+| **4** | **Volume Provisioning** | Auto-detect `[mounts]` in `fly.toml` and run `fly volumes create` during deployment. | [X] |
+| **5** | **Secrets UI** | Add a dynamic key-value editor to the `ConfigStep` for runtime secrets. | [X] |
+| **6** | **Pre-flight Checks** | Add a phase to verify token permissions and "Organization" status before starting the remote build. | [X] |
+| **7** | **Optimization: Policy Engine** | Extracted hardcoded deployment patches into a dedicated Policy Engine and switched to memory-safe streaming downloads. | [X] |

@@ -1,9 +1,12 @@
 import { useDeployStore } from '../store/deployStore';
 import { GlassCard } from './GlassCard';
-import { FileCode, Rocket, ArrowLeft, Cpu, ShieldAlert, Globe, Link as LinkIcon, Database, Activity, Download } from 'lucide-react';
+import { FileCode, Rocket, ArrowLeft, Cpu, ShieldAlert, Globe, Link as LinkIcon, Database, Activity, Download, Plus, Trash2, Key } from 'lucide-react';
+import { useState } from 'react';
 
 export const ConfigStep = () => {
-  const { generatedConfig, setConfig, setStep, sessionId, flyToken, appName, region, repoUrl, githubToken, addLog, setDeployedUrl, deployApp } = useDeployStore();
+  const { generatedConfig, setConfig, setStep, sessionId, flyToken, appName, region, repoUrl, githubToken, addLog, setDeployedUrl, deployApp, secrets, setSecrets } = useDeployStore();
+  const [newSecretKey, setNewSecretKey] = useState('');
+  const [newSecretValue, setNewSecretValue] = useState('');
 
   const handleDeploy = () => {
       deployApp();
@@ -31,6 +34,24 @@ export const ConfigStep = () => {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const handleAddSecret = () => {
+    if (newSecretKey && newSecretValue) {
+        setSecrets({ ...secrets, [newSecretKey]: newSecretValue });
+        setNewSecretKey('');
+        setNewSecretValue('');
+    }
+  };
+
+  const handleDeleteSecret = (key: string) => {
+    const newSecrets = { ...secrets };
+    delete newSecrets[key];
+    setSecrets(newSecrets);
+  };
+
+  const handleSecretChange = (key: string, value: string) => {
+      setSecrets({ ...secrets, [key]: value });
   };
 
   if (!generatedConfig) return null;
@@ -83,7 +104,7 @@ export const ConfigStep = () => {
 
           <GlassCard className="border-purple-500/20">
             <h3 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
-              <ShieldAlert className="w-5 h-5 text-purple-400" /> Secrets & Env
+              <ShieldAlert className="w-5 h-5 text-purple-400" /> Analysis Env Hints
             </h3>
             <div className="space-y-3">
                 {Object.keys(generatedConfig.envVars).length > 0 ? (
@@ -99,11 +120,6 @@ export const ConfigStep = () => {
                 ) : (
                     <p className="text-sm text-slate-500 italic">No specific env variables identified.</p>
                 )}
-            </div>
-            <div className="mt-4 pt-4 border-t border-white/5">
-                <p className="text-xs text-slate-500">
-                    Run <code className="bg-slate-800 px-1 rounded">fly secrets set KEY=VALUE</code> after deployment.
-                </p>
             </div>
           </GlassCard>
 
@@ -124,7 +140,7 @@ export const ConfigStep = () => {
         {/* Configuration Main Editors */}
         <div className="lg:col-span-2 space-y-6">
           <div className="grid grid-cols-1 gap-6">
-            <GlassCard className="flex flex-col h-[500px] p-0 overflow-hidden border-white/5">
+            <GlassCard className="flex flex-col h-[400px] p-0 overflow-hidden border-white/5">
                 <div className="bg-white/5 px-6 py-3 flex items-center justify-between border-b border-white/5">
                     <div className="flex items-center gap-2 text-sm text-slate-300 font-mono">
                         <FileCode className="w-4 h-4 text-blue-400" /> fly.toml
@@ -146,7 +162,7 @@ export const ConfigStep = () => {
                 </div>
             </GlassCard>
 
-            <GlassCard className="flex flex-col h-[500px] p-0 overflow-hidden border-white/5">
+            <GlassCard className="flex flex-col h-[400px] p-0 overflow-hidden border-white/5">
                 <div className="bg-white/5 px-6 py-3 flex items-center justify-between border-b border-white/5">
                     <div className="flex items-center gap-2 text-sm text-slate-300 font-mono">
                         <Globe className="w-4 h-4 text-green-400" /> Dockerfile
@@ -182,6 +198,68 @@ export const ConfigStep = () => {
                         </p>
                     </div>
                 )}
+            </GlassCard>
+
+            {/* Secrets Manager */}
+            <GlassCard className="border-purple-500/20">
+                <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                        <Key className="w-5 h-5 text-purple-400" /> Runtime Secrets
+                    </h3>
+                    <span className="text-xs text-slate-500">Set environment variables securely</span>
+                </div>
+                
+                <div className="space-y-3 mb-4">
+                    {Object.entries(secrets).map(([key, value]) => (
+                        <div key={key} className="flex gap-2 items-center">
+                            <div className="flex-1 flex gap-2">
+                                <input 
+                                    type="text" 
+                                    value={key} 
+                                    readOnly
+                                    className="bg-black/40 border border-white/10 rounded px-3 py-2 text-sm text-purple-300 font-mono w-1/3"
+                                />
+                                <input 
+                                    type="password" 
+                                    value={value} 
+                                    onChange={(e) => handleSecretChange(key, e.target.value)}
+                                    placeholder="Value"
+                                    className="bg-black/40 border border-white/10 rounded px-3 py-2 text-sm text-white flex-1 focus:border-purple-500 focus:outline-none"
+                                />
+                            </div>
+                            <button onClick={() => handleDeleteSecret(key)} className="p-2 text-slate-500 hover:text-red-400 transition-colors">
+                                <Trash2 className="w-4 h-4" />
+                            </button>
+                        </div>
+                    ))}
+                    {Object.keys(secrets).length === 0 && (
+                        <p className="text-sm text-slate-500 italic p-2">No secrets configured. Add one below.</p>
+                    )}
+                </div>
+
+                <div className="flex gap-2 pt-4 border-t border-white/5">
+                    <input 
+                        type="text" 
+                        value={newSecretKey}
+                        onChange={(e) => setNewSecretKey(e.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, ''))}
+                        placeholder="NEW_KEY"
+                        className="bg-black/40 border border-white/10 rounded px-3 py-2 text-sm text-white font-mono w-1/3 focus:border-purple-500 focus:outline-none"
+                    />
+                    <input 
+                        type="text" 
+                        value={newSecretValue}
+                        onChange={(e) => setNewSecretValue(e.target.value)}
+                        placeholder="Value"
+                        className="bg-black/40 border border-white/10 rounded px-3 py-2 text-sm text-white flex-1 focus:border-purple-500 focus:outline-none"
+                    />
+                    <button 
+                        onClick={handleAddSecret}
+                        disabled={!newSecretKey || !newSecretValue}
+                        className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                        <Plus className="w-4 h-4" /> Add
+                    </button>
+                </div>
             </GlassCard>
           </div>
 
