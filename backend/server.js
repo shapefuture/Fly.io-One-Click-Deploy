@@ -96,7 +96,7 @@ app.post('/api/analyze', async (req, res) => {
         // 3. Execute Strategy
         const result = await strategy.analyze(repoPath, repoUrl, appName, aiConfig, preferExistingConfig);
 
-        // 4. Global Post-Processing (The "Healer" - Policy Engine)
+        // 4. Global Post-Processing (The "Healer")
         if (result.fly_toml) {
             if (appName) {
                 if (/^app\s*=/m.test(result.fly_toml)) {
@@ -227,7 +227,11 @@ dist
         } catch (e) { }
 
         // --- POLICY ENGINE EXECUTION ---
-        await PolicyEngine.apply(targetDir, appName, region, stream);
+        try {
+            await PolicyEngine.apply(targetDir, appName, region, stream);
+        } catch (e) {
+            stream(`⚠️ Policy Engine check failed (Non-critical): ${e.message}`, 'warning');
+        }
 
         stream("Registering app...", "info");
         try {
@@ -322,19 +326,13 @@ dist
              let healthy = false;
              for (let i = 0; i < 5; i++) { // Try for ~25 seconds (5 * 5s)
                  try {
-                     // Basic fetch, ignoring self-signed certs implicitly if possible or catching the error
-                     // Note: Native fetch in Node 18+ does not support ignoring certs easily without Undici agent.
-                     // However, we can treat specific errors as "Proof of Life".
                      const healthRes = await fetch(url).catch(e => {
-                         // If we get a cert error, the server IS listening (Handshake happened)
                          if (e.cause?.code === 'DEPTH_ZERO_SELF_SIGNED_CERT' || e.message.includes('certificate')) {
                              return { ok: true, status: 200, note: "Self-Signed Cert Detected" };
                          }
                          throw e;
                      });
 
-                     // Accept 200-299, but also 404/403 (Server is running but path is wrong/protected)
-                     // This is crucial for Proxies which often return 404/403 on root.
                      if (healthRes.ok || healthRes.status === 404 || healthRes.status === 403 || (healthRes as any).note) {
                          healthy = true;
                          const statusMsg = (healthRes as any).note || healthRes.status;
@@ -344,14 +342,13 @@ dist
                          stream(`Health check pending (${healthRes.status})...`, 'log');
                      }
                  } catch (e) {
-                     // Check for specific "Proof of Life" connection errors
                      const errStr = e.message || '';
                      if (errStr.includes('certificate') || errStr.includes('DEPTH_ZERO_SELF_SIGNED_CERT')) {
                          healthy = true;
                          stream(`✅ Health check passed (Self-Signed Cert Detected)`, 'success');
                          break;
                      }
-                     stream(`Waiting for DNS propagation... (${errStr})`, 'log');
+                     stream(`Waiting for DNS propagation...`, 'log');
                  }
                  await new Promise(r => setTimeout(r, 5000));
              }

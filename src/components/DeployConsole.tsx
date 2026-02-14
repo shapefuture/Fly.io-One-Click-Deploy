@@ -1,9 +1,9 @@
 import { useEffect, useRef } from 'react';
 import { useDeployStore } from '../store/deployStore';
-import { Terminal, Loader2, CheckCircle2, ExternalLink, AlertTriangle, ShieldCheck } from 'lucide-react';
+import { Terminal, Loader2, CheckCircle2, ExternalLink, AlertTriangle } from 'lucide-react';
 
 export const DeployConsole = () => {
-  const { logs, currentStep, deployedUrl, error, generatedConfig } = useDeployStore();
+  const { logs, currentStep, deployedUrl, error } = useDeployStore();
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -11,9 +11,6 @@ export const DeployConsole = () => {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [logs]);
-
-  // Detect if the deployed app is a Proxy (Sniproxy, etc)
-  const isProxy = generatedConfig?.stack?.toLowerCase().includes('proxy');
 
   const getLogStyle = (log: { message: string, type: string }) => {
     if (log.type === 'error') return 'text-red-400 bg-red-900/10 border-l-2 border-red-500 pl-2 py-1 my-1';
@@ -54,7 +51,7 @@ export const DeployConsole = () => {
             </>
           )}
         </h2>
-        {deployedUrl && !isProxy && (
+        {deployedUrl && (
           <a
             href={deployedUrl}
             target="_blank"
@@ -65,22 +62,6 @@ export const DeployConsole = () => {
           </a>
         )}
       </div>
-
-      {currentStep === 'success' && isProxy && (
-          <div className="bg-blue-500/10 border border-blue-500/20 p-4 rounded-xl flex items-start gap-3">
-              <ShieldCheck className="w-5 h-5 text-blue-400 mt-1" />
-              <div>
-                  <h3 className="font-bold text-blue-300">Proxy Deployed Successfully</h3>
-                  <p className="text-sm text-slate-300 mt-1">
-                      Transparent proxies like Sniproxy <strong>do not show content</strong> when opened in a browser. 
-                      Instead, configure your devices or DNS to point to:
-                  </p>
-                  <code className="block mt-2 bg-black/30 p-2 rounded text-blue-200 font-mono">
-                      {deployedUrl?.replace('https://', '')}
-                  </code>
-              </div>
-          </div>
-      )}
 
       <div className="rounded-xl overflow-hidden bg-[#0a0a0a] border border-white/10 shadow-2xl font-mono text-sm relative">
         <div className="bg-[#1a1a1a] px-4 py-2 flex items-center justify-between border-b border-white/5">

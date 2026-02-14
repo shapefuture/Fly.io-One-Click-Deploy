@@ -16,7 +16,7 @@ export const AIStrategy = {
             for (const f of files) {
                 try { c += `\n${f}:\n` + await fs.readFile(path.join(repoPath, f), 'utf8'); } catch {}
             }
-            return c.slice(12000); // Increased context window slightly
+            return c.slice(12000);
         })();
 
         const hasDockerfile = context.includes("Dockerfile:");
@@ -77,9 +77,11 @@ export const AIStrategy = {
                 json = JSON.parse(completion.choices[0].message.content);
             } else {
                 const apiKey = aiConfig?.apiKey || process.env.API_KEY;
+                if (!apiKey) throw new Error("API Key missing");
+                
                 const ai = new GoogleGenAI({ apiKey });
                 
-                // Define Schema for Strict Structured Output
+                // Use Type from @google/genai as required
                 const schema = {
                     type: Type.OBJECT,
                     properties: {
@@ -124,9 +126,7 @@ export const AIStrategy = {
                     }
                 });
                 
-                // Extract text correctly based on guidelines
-                const text = result.text;
-                json = JSON.parse(text);
+                json = JSON.parse(result.text);
             }
         } catch (e) {
             console.error("AI Generation Error:", e);
