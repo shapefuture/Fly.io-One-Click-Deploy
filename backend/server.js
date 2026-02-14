@@ -289,8 +289,13 @@ app.post('/api/analyze', async (req, res) => {
            - Note: Fly.io maps external 80/443 to this internal port.
         3. **Fly.toml Generation**:
            - Create a complete 'fly.toml'.
-           - Use the [[services]] or [http_service] block.
+           - **IMPORTANT SYNTAX RULES**:
+             - Do NOT use an [app] block. 'app' and 'primary_region' must be top-level keys.
+             - Prefer using [http_service] for web applications.
+             - If using [[services]], ensure port 80 has 'handlers = ["http"]' (to force redirect) and port 443 has 'handlers = ["tls", "http"]'. 
+             - Only use 'handlers = ["tls"]' if the application expects raw TCP traffic (e.g., specific proxies).
            - Set 'auto_stop_machines = true' and 'auto_start_machines = true'.
+           - **COST EFFICIENCY**: Include a [[vm]] block with 'cpu_kind = "shared"', 'cpus = 1', and 'memory_mb = 256' to target the free/hobby tier.
            - Add a [checks] block for health monitoring if a health endpoint (/health, /up, /) is likely.
            - IF 'fly.toml' exists in Config Content and user preference is set, REUSE IT unless broken.
         4. **Dockerfile Generation**:
@@ -476,10 +481,16 @@ app.post('/api/deploy', async (req, res) => {
         const tomlPath = path.join(targetDir, 'fly.toml');
         
         let finalToml = flyToml;
-        finalToml = finalToml.replace(/^app\s*=.*$/m, '');
-        finalToml = finalToml.replace(/^primary_region\s*=.*$/m, '');
+        
+        // Remove [app] block header if present
+        finalToml = finalToml.replace(/^\[app\]\s*$/gm, '');
+        // Remove existing app/name/region definitions (top level or inside table)
+        finalToml = finalToml.replace(/^(app|name)\s*=.*/gm, '');
+        finalToml = finalToml.replace(/^primary_region\s*=.*/gm, '');
+        
+        // Prepare new header
         const header = `app = "${appName}"\nprimary_region = "${region}"\n`;
-        finalToml = header + finalToml;
+        finalToml = header + finalToml.trim();
 
         await fs.writeFile(tomlPath, finalToml);
         if (dockerfile) {
