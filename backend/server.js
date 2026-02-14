@@ -346,7 +346,8 @@ app.post('/api/analyze', async (req, res) => {
             return c.slice(0, 8000);
         })();
 
-        const prompt = `DevOps Task: Config for Fly.io. Repo: ${repoUrl}. Context: ${context}. Return JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}. Syntax: Use [http_service] instead of [app].`;
+        // STRICT PROMPT to avoid "checks" string error
+        const prompt = `DevOps Task: Config for Fly.io. Repo: ${repoUrl}. Context: ${context}. Return JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}. Syntax: Use [http_service] instead of [app]. IMPORTANT: Do NOT generate a top-level 'checks' property as a string. If you need checks, use [[services.checks]] or [http_service.checks].`;
 
         try {
             const provider = aiConfig?.provider || 'gemini';
@@ -356,7 +357,7 @@ app.post('/api/analyze', async (req, res) => {
                 const openai = new OpenAI({ baseURL: 'https://openrouter.ai/api/v1', apiKey: aiConfig.apiKey });
                 const completion = await openai.chat.completions.create({
                     model: aiConfig.model || 'google/gemini-2.0-flash-exp:free',
-                    messages: [{ role: 'system', content: 'JSON only.' }, { role: 'user', content: prompt }],
+                    messages: [{ role: 'system', content: 'JSON only. Valid TOML.' }, { role: 'user', content: prompt }],
                     response_format: { type: 'json_object' }
                 });
                 json = JSON.parse(completion.choices[0].message.content);
@@ -443,9 +444,14 @@ app.post('/api/deploy', async (req, res) => {
              try { tomlContent = await fs.readFile(tomlPath, 'utf8'); } catch { throw new Error("Missing fly.toml"); }
         }
         
-        // Sanitize TOML
+        // Sanitize TOML (CRITICAL FIX FOR 'checks' ERROR)
+        // 1. Force app name and region
+        // 2. Remove existing app/region keys
+        // 3. Remove invalid top-level checks="string" which breaks flyctl
         tomlContent = `app = "${appName}"\nprimary_region = "${region}"\n` + 
-            tomlContent.replace(/^app\s*=.*$/gm, '').replace(/^primary_region\s*=.*$/gm, '');
+            tomlContent.replace(/^app\s*=.*$/gm, '')
+                       .replace(/^primary_region\s*=.*$/gm, '')
+                       .replace(/^checks\s*=\s*".*"/gm, ''); 
             
         await fs.writeFile(tomlPath, tomlContent);
         if (dockerfile) await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
