@@ -127,7 +127,7 @@ export const InputStep = () => {
   const generateBadgeCode = () => {
     const baseUrl = window.location.origin;
     const targetUrl = repoUrl ? `${baseUrl}?repo=${normalizeRepoUrl(repoUrl)}` : `${baseUrl}?repo=YOUR_GITHUB_URL`;
-    const badgeImage = "https://img.shields.io/badge/deploy%20to-fly.io-4c48db?style=for-the-badge&logo=fly.io";
+    const badgeImage = "https://raw.githubusercontent.com/shapefuture/bolt.diy/main/flyio-button.svg";
     return `[![Deploy to Fly.io](${badgeImage})](${targetUrl})`;
   };
 
