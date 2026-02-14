@@ -1,6 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { GoogleGenAI, SchemaType } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import OpenAI from 'openai';
 
 export const AIStrategy = {
@@ -81,32 +81,32 @@ export const AIStrategy = {
                 
                 // Define Schema for Strict Structured Output
                 const schema = {
-                    type: SchemaType.OBJECT,
+                    type: Type.OBJECT,
                     properties: {
-                        fly_toml: { type: SchemaType.STRING, description: "The complete fly.toml configuration file content." },
-                        dockerfile: { type: SchemaType.STRING, nullable: true, description: "The Dockerfile content, or null if existing." },
-                        explanation: { type: SchemaType.STRING, description: "Brief explanation of the configuration choices." },
-                        stack: { type: SchemaType.STRING, description: "Detected tech stack (e.g., Node.js, Python, Go)." },
+                        fly_toml: { type: Type.STRING, description: "The complete fly.toml configuration file content." },
+                        dockerfile: { type: Type.STRING, nullable: true, description: "The Dockerfile content, or null if existing." },
+                        explanation: { type: Type.STRING, description: "Brief explanation of the configuration choices." },
+                        stack: { type: Type.STRING, description: "Detected tech stack (e.g., Node.js, Python, Go)." },
                         envVars: {
-                            type: SchemaType.ARRAY,
+                            type: Type.ARRAY,
                             items: {
-                                type: SchemaType.OBJECT,
+                                type: Type.OBJECT,
                                 properties: {
-                                    name: { type: SchemaType.STRING },
-                                    reason: { type: SchemaType.STRING }
+                                    name: { type: Type.STRING },
+                                    reason: { type: Type.STRING }
                                 },
                                 required: ["name", "reason"]
                             }
                         },
-                        healthCheckPath: { type: SchemaType.STRING, nullable: true },
+                        healthCheckPath: { type: Type.STRING, nullable: true },
                         volumes: {
-                            type: SchemaType.ARRAY,
+                            type: Type.ARRAY,
                             description: "List of volumes required by the app.",
                             items: {
-                                type: SchemaType.OBJECT,
+                                type: Type.OBJECT,
                                 properties: {
-                                    name: { type: SchemaType.STRING, description: "Volume name (e.g., 'data')" },
-                                    path: { type: SchemaType.STRING, description: "Mount path (e.g., '/data')" }
+                                    name: { type: Type.STRING, description: "Volume name (e.g., 'data')" },
+                                    path: { type: Type.STRING, description: "Mount path (e.g., '/data')" }
                                 },
                                 required: ["name", "path"]
                             }
@@ -123,7 +123,10 @@ export const AIStrategy = {
                         responseSchema: schema
                     }
                 });
-                json = JSON.parse(result.text);
+                
+                // Extract text correctly based on guidelines
+                const text = result.text;
+                json = JSON.parse(text);
             }
         } catch (e) {
             console.error("AI Generation Error:", e);
