@@ -31,6 +31,17 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = process.env.PORT || 3000;
 
+// --- GLOBAL ERROR HANDLERS (CRASH GUARD) ---
+process.on('uncaughtException', (err) => {
+    console.error('🔥 UNCAUGHT EXCEPTION:', err);
+    // Keep alive if possible, but in production, we might want to restart.
+    // For this tool, logging is critical to debug "Backend Unreachable".
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('🔥 UNHANDLED REJECTION:', reason);
+});
+
 // --- ENVIRONMENT DETECTION ---
 // Detect Vercel, AWS Lambda, or generic container environments
 const IS_VERCEL = process.env.VERCEL === '1' || !!process.env.NOW_REGION || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
@@ -524,6 +535,8 @@ acl:
 WORKDIR /app
 RUN apk add --no-cache git
 COPY . .
+# CRITICAL: Copy config explicitly during build phase to ensure it exists in context
+COPY config.yaml /config.yaml
 # Build attempts: specific cmd path first, then root
 RUN if [ -d "./cmd/sniproxy" ]; then \
       go build -ldflags "-s -w" -o /sniproxy ./cmd/sniproxy; \
@@ -534,6 +547,7 @@ RUN if [ -d "./cmd/sniproxy" ]; then \
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /sniproxy /sniproxy
+# Ensure config is present in final image
 COPY config.yaml /config.yaml
 ENTRYPOINT ["/sniproxy", "-c", "/config.yaml"]
 `;
@@ -661,6 +675,36 @@ app.post('/api/deploy', async (req, res) => {
                 await fs.writeFile(filePath, f.content);
                 stream(`Generated ${f.name}`, 'info');
             }
+        }
+
+        // --- CONTEXT SANITIZER PROTOCOL ---
+        stream("🛡️ Sanitizing Build Context...", "info");
+        const dockerIgnorePath = path.join(targetDir, '.dockerignore');
+        try {
+            // 1. DELETE existing .dockerignore to prevent it from hiding our config.yaml
+            await fs.rm(dockerIgnorePath, { force: true });
+            stream("Deleted existing .dockerignore to unblock config upload.", "log");
+
+            // 2. CREATE a permissive .dockerignore
+            // We explicitly whitelist everything we need.
+            const permissiveIgnore = `
+.git
+node_modules
+dist
+.env
+            `;
+            await fs.writeFile(dockerIgnorePath, permissiveIgnore.trim());
+            stream("Injected permissive .dockerignore.", "log");
+        } catch (e) {
+            stream(`Warning: Context sanitization had issues: ${e.message}`, "warning");
+        }
+
+        // --- CONTEXT VERIFICATION LOGGING ---
+        try {
+            const filesInRoot = await fs.readdir(targetDir);
+            stream(`Build Context Root contains: ${filesInRoot.join(', ')}`, "log");
+        } catch (e) {
+            stream("Could not list build context (minor warning).", "warning");
         }
 
         stream("Registering app...", "info");
