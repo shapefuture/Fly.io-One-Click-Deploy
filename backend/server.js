@@ -31,7 +31,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = process.env.PORT || 3000;
 
-// --- GLOBAL ERROR HANDLERS (CRASH GUARD) ---
+// --- GLOBAL ERROR HANDLERS ---
 process.on('uncaughtException', (err) => {
     console.error('🔥 UNCAUGHT EXCEPTION:', err);
 });
@@ -52,7 +52,6 @@ const TEMP_DIR = path.join(BASE_WORK_DIR, 'fly_deployer_workspaces');
 const FLY_INSTALL_DIR = path.join(VERCEL_HOME, '.fly');
 const FLY_BIN = path.join(FLY_INSTALL_DIR, 'bin', BIN_NAME);
 
-// Global locks
 let flyBinPath = null;
 let installationPromise = null;
 let lastInstallError = null;
@@ -61,7 +60,6 @@ app.use(cors());
 app.use(express.json());
 
 // --- INITIALIZATION ---
-
 async function ensureDirs() {
     try {
         await fs.mkdir(TEMP_DIR, { recursive: true });
@@ -85,9 +83,7 @@ async function ensureDirs() {
     }
 }
 
-/**
- * NUCLEAR INSTALLER v3 (Vercel-Optimized)
- */
+// --- INSTALLER (Antifragile v3) ---
 async function performAntifragileInstallation() {
     const log = (msg) => console.log(`[FlyInstaller] ${msg}`);
     const warn = (msg) => console.warn(`[FlyInstaller] ${msg}`);
@@ -125,20 +121,12 @@ async function performAntifragileInstallation() {
     // Strategy 1: Shell
     if (!IS_WINDOWS) {
         try {
-            log("Strategy 1: curl | sh");
-            await execa('sh', ['-c', 'curl -L https://fly.io/install.sh | sh'], {
-                env: CHILD_ENV,
-                timeout: 45000
-            });
+            await execa('sh', ['-c', 'curl -L https://fly.io/install.sh | sh'], { env: CHILD_ENV, timeout: 45000 });
             if (await verify(FLY_BIN)) return FLY_BIN;
         } catch (e) { }
 
         try {
-            log("Strategy 1b: wget | sh");
-            await execa('sh', ['-c', 'wget -qO- https://fly.io/install.sh | sh'], {
-                env: CHILD_ENV,
-                timeout: 45000
-            });
+            await execa('sh', ['-c', 'wget -qO- https://fly.io/install.sh | sh'], { env: CHILD_ENV, timeout: 45000 });
             if (await verify(FLY_BIN)) return FLY_BIN;
         } catch (e) { }
     }
@@ -158,10 +146,9 @@ async function performAntifragileInstallation() {
                 const releaseData = await releaseRes.json();
                 versionsToTry.push(releaseData.tag_name.replace(/^v/, ''));
             }
-        } catch (e) { warn("GitHub API failed, skipping latest version check."); }
+        } catch (e) { }
 
-        versionsToTry.push("0.4.11");
-        versionsToTry.push("0.2.22");
+        versionsToTry.push("0.4.11"); // Stable fallback
         versionsToTry = [...new Set(versionsToTry)];
 
         const fileExts = platform === 'win32' ? ['.zip'] : ['.tar.gz'];
@@ -212,7 +199,7 @@ async function performAntifragileInstallation() {
                 } catch (dlErr) { }
             }
         }
-    } catch (e) { warn(`Strategy 2 Matrix failed: ${e.message}`); }
+    } catch (e) { warn(`Strategy 2 failed: ${e.message}`); }
     throw new Error(`Installation failed.`);
 }
 
@@ -282,45 +269,61 @@ app.post('/api/analyze', async (req, res) => {
 
         const context = await (async () => {
             if (repoPath === workDir) return "No code available.";
-            const files = ['package.json', 'fly.toml', 'Dockerfile', 'requirements.txt', 'go.mod'];
-            let c = "";
-            for (const f of files) {
-                try { c += `\n${f}:\n` + await fs.readFile(path.join(repoPath, f), 'utf8'); } catch {}
-            }
-            return c.slice(0, 8000);
+            // Expanded list to catch more config types generic to any app
+            const files = ['package.json', 'fly.toml', 'Dockerfile', 'requirements.txt', 'go.mod', 'config.yaml', 'config.example.yaml', 'config.defaults.yaml', '.env.example'];
+            
+            // Recursive crawler for deep config files (limited depth)
+            const getFiles = async (dir, depth = 0) => {
+                if (depth > 2) return "";
+                let c = "";
+                const list = await fs.readdir(dir).catch(() => []);
+                for (const item of list) {
+                    const fullPath = path.join(dir, item);
+                    const stats = await fs.stat(fullPath).catch(() => null);
+                    if (stats && stats.isDirectory() && !item.startsWith('.')) {
+                        c += await getFiles(fullPath, depth + 1);
+                    } else if (files.includes(item) || item.endsWith('.config.js') || item.endsWith('.toml') || item.endsWith('.yaml')) {
+                        try { 
+                            const content = await fs.readFile(fullPath, 'utf8');
+                            if (content.length < 10000) c += `\nFile: ${item} (Path: ${fullPath.replace(repoPath, '')}):\n${content}\n`;
+                        } catch {}
+                    }
+                }
+                return c;
+            };
+            return (await getFiles(repoPath)).slice(0, 15000); // Increased context window
         })();
 
         const hasDockerfile = context.includes("Dockerfile:");
 
-        const prompt = `DevOps Task: Config for Fly.io. Repo: ${repoUrl}. Context: ${context}. Return JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}.
-        CRITICAL RULES:
-        1. fly.toml strings MUST use SINGLE QUOTES.
-        2. [[vm]] section MUST include BOTH: memory = '1gb' AND memory_mb = 1024.
-        3. If Dockerfile exists, set 'dockerfile' to null.
-        4. If generating Dockerfile, use JSON array syntax for CMD.
-        5. Detect 'internal_port' (8080, 3000, 80).
-        6. Sniproxy crash fix: override PUBLIC_IP vars.
+        // --- UNIVERSAL PROMPT ---
+        const prompt = `DevOps Architect Task: Generate Fly.io configuration for this repo. Context provided.
         
-        Preferred Structure:
-        app = 'name'
-        primary_region = 'iad'
-        [build]
-        dockerfile = 'Dockerfile'
-        [[vm]]
-        memory = '1gb'
-        cpu_kind = 'shared'
-        cpus = 1
-        memory_mb = 256
-        [[services]]
-        internal_port = 8080
-        protocol = 'tcp'
-        [[services.ports]]
-            port = 443
-            handlers = ['tls', 'http']
-        [[services.checks]]
-            type = 'tcp'
-            interval = '10s'
-            timeout = '2s'
+        RETURN JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath, files:[{name, content}]}.
+
+        ANALYSIS RULES:
+        1. **Detect App Type**: 
+           - 'WEB': Standard HTTP app (Node, Python, HTML). Needs HTTP checks.
+           - 'NETWORK': Low-level TCP/UDP service (DNS server, Proxy, VPN). **MUST use TCP checks**, NOT HTTP.
+        2. **Binding**: ALL apps must bind to '0.0.0.0' (IPv4) or '::' (IPv6). If code binds to '127.0.0.1', override via Environment Variable or Config File.
+        3. **Config Files**: If the app relies on a config file (e.g., config.yaml, settings.toml) that is MISSING (only .example exists), YOU MUST GENERATE IT in the 'files' array.
+           - **CRITICAL**: If generating DNS upstreams in YAML/JSON, use VALID SCHEMES (e.g., 'udp://1.1.1.1:53', 'tcp://1.1.1.1:53'). DO NOT put raw IPs where URIs are expected.
+        4. **Dockerfile**: 
+           - If missing, generate a robust Multi-Stage build.
+           - If Go: Use 'golang:alpine' builder -> 'alpine' runner. Install 'ca-certificates'.
+           - If Node: Use 'node:alpine'.
+        5. **fly.toml**:
+           - Use SINGLE QUOTES.
+           - [[vm]] must have 'memory' AND 'memory_mb'.
+           - services.internal_port must match the container's listening port.
+
+        OUTPUT TEMPLATE:
+        {
+          "fly_toml": "...",
+          "dockerfile": "...", 
+          "files": [ { "name": "config.yaml", "content": "..." } ], 
+          "envVars": [ { "name": "PORT", "reason": "Standard" } ]
+        }
         `;
 
         try {
@@ -348,82 +351,7 @@ app.post('/api/analyze', async (req, res) => {
             
             if (hasDockerfile) json.dockerfile = null;
 
-            // --- SAFETY NET FOR SNIPROXY ---
-            if (repoUrl.toLowerCase().includes('sniproxy')) {
-                console.log("🛡️ Applying Sniproxy Max Fallback Safety Net");
-                
-                if (json.fly_toml) {
-                    json.fly_toml = json.fly_toml.replace(/type = 'http'/g, "type = 'tcp'")
-                        .replace(/path = '.*'/g, "# path removed")
-                        .replace(/handlers = \['http'\]/g, "handlers = []");
-                }
-
-                const safetyVars = {
-                    "SNIPROXY_GENERAL__PUBLIC_IPV4": "127.0.0.1",
-                    "SNIPROXY_GENERAL__PUBLIC_IPV6": "::1",
-                    "SNIPROXY_GENERAL__BIND_HTTP": "0.0.0.0:80",
-                    "SNIPROXY_GENERAL__BIND_HTTPS": "0.0.0.0:443",
-                    "GOMAXPROCS": "1"
-                };
-
-                if (json.fly_toml) {
-                     const keys = Object.keys(safetyVars).concat(["PUBLIC_IPV4", "BIND_HTTP"]);
-                     keys.forEach(key => {
-                         json.fly_toml = json.fly_toml.replace(new RegExp(`^\\s*${key}\\s*=.*$`, 'gm'), '');
-                     });
-                     const envContent = Object.entries(safetyVars).map(([k, v]) => `  ${k} = '${v}'`).join('\n');
-                     if (/^\s*\[env\]/m.test(json.fly_toml)) {
-                        json.fly_toml = json.fly_toml.replace(/(\[env\])/, `$1\n${envContent}`);
-                     } else {
-                        json.fly_toml += `\n[env]\n${envContent}\n`;
-                    }
-                }
-
-                if (!json.envVars) json.envVars = [];
-                Object.entries(safetyVars).forEach(([k, v]) => {
-                    if (!json.envVars.find(e => e.name === k)) json.envVars.push({ name: k, reason: "Crash Prevention" });
-                });
-
-                // FIXED: Config now uses valid URI scheme for DNS
-                const sniproxyConfig = `general:
-  upstream_dns: "udp://1.1.1.1:53"
-  upstream_dns_over_socks5: false
-  bind_dns_over_udp: "0.0.0.0:53"
-  bind_http: "0.0.0.0:80"
-  bind_https: "0.0.0.0:443"
-  public_ipv4: "127.0.0.1"
-  public_ipv6: "::1"
-  allow_conn_to_local: false
-  log_level: info
-
-acl:
-  geoip:
-    enabled: false
-  domain:
-    enabled: false
-  cidr:
-    enabled: false
-`;
-                json.files = [
-                    { name: "config.yaml", content: sniproxyConfig },
-                    { name: "sniproxy/cmd/sniproxy/config.defaults.yaml", content: sniproxyConfig }
-                ];
-
-                json.dockerfile = `FROM golang:alpine AS builder
-WORKDIR /app
-RUN apk add --no-cache git
-COPY . .
-COPY config.yaml /config.yaml
-RUN if [ -d "./cmd/sniproxy" ]; then go build -ldflags "-s -w" -o /sniproxy ./cmd/sniproxy; else go build -ldflags "-s -w" -o /sniproxy .; fi
-FROM alpine:latest
-RUN apk add --no-cache ca-certificates
-COPY --from=builder /sniproxy /sniproxy
-COPY config.yaml /config.yaml
-ENTRYPOINT ["/sniproxy", "-c", "/config.yaml"]
-`;
-                json.explanation = (json.explanation || "") + " [System] Applied Max Fallback: Validated DNS URI scheme.";
-            }
-
+            // Universal Env Var formatting
             const envVars = {};
             if (Array.isArray(json.envVars)) json.envVars.forEach(e => envVars[e.name] = e.reason);
             else if (json.envVars) Object.entries(json.envVars).forEach(([k, v]) => envVars[k] = v);
@@ -432,7 +360,7 @@ ENTRYPOINT ["/sniproxy", "-c", "/config.yaml"]
 
         } catch (e) {
             console.error("AI Error:", e);
-            res.json({ success: true, sessionId, fly_toml: `app='app'`, dockerfile: null, explanation: "Error", envVars: {}, stack: "Error", files: [] });
+            res.json({ success: true, sessionId, fly_toml: `app='app'`, dockerfile: null, explanation: "Analysis Failed: " + e.message, envVars: {}, stack: "Error", files: [] });
         }
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -488,11 +416,10 @@ app.post('/api/deploy', async (req, res) => {
              try { tomlContent = await fs.readFile(tomlPath, 'utf8'); } catch { throw new Error("Missing fly.toml"); }
         }
         
+        // Universal TOML Cleanup (Remove hardcoded app/region to let CLI handle it via args or new config)
         tomlContent = `app = '${appName}'\nprimary_region = '${region}'\n` + 
             tomlContent.replace(/^app\s*=.*$/gm, '')
-                       .replace(/^primary_region\s*=.*$/gm, '')
-                       .replace(/^checks\s*=\s*".*"/gm, '')
-                       .replace(/^checks\s*=\s*'.*'/gm, ''); 
+                       .replace(/^primary_region\s*=.*$/gm, '');
             
         await fs.writeFile(tomlPath, tomlContent);
         
@@ -500,57 +427,34 @@ app.post('/api/deploy', async (req, res) => {
             await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
         }
 
-        // Write Extra Files with HOT PATCHING
+        // --- UNIVERSAL FILE GENERATOR ---
+        // Writes ANY config files the AI deemed necessary (config.yaml, .env, script.sh)
         if (files && Array.isArray(files)) {
             for (const f of files) {
                 const filePath = path.join(targetDir, f.name);
                 await fs.mkdir(path.dirname(filePath), { recursive: true });
-                
-                // --- ANTIFRAGILE HOT-PATCH ---
-                // If the frontend passed a config with the old broken "1.1.1.1" URI, fix it here instantly.
-                let content = f.content;
-                if (f.name.endsWith('yaml') || f.name.endsWith('yml')) {
-                    // Replace standalone IP with udp:// scheme
-                    content = content.replace(/upstream_dns:\s*"(\d+\.\d+\.\d+\.\d+)"/g, 'upstream_dns: "udp://$1:53"');
-                }
-                
-                await fs.writeFile(filePath, content);
-                stream(`Generated ${f.name} (Patched)`, 'info');
+                await fs.writeFile(filePath, f.content);
+                stream(`Generated configuration: ${f.name}`, 'info');
             }
         }
 
-        // --- JUST-IN-TIME HEALER ---
-        if (dockerfile && dockerfile.includes('COPY config.yaml')) {
-             const configPath = path.join(targetDir, 'config.yaml');
-             if (!existsSync(configPath)) {
-                 stream("⚠️  Healer: Missing config.yaml detected. Regenerating...", "warning");
-                 const emergencyConfig = `general:
-  upstream_dns: "udp://1.1.1.1:53"
-  bind_http: "0.0.0.0:80"
-  bind_https: "0.0.0.0:443"
-  public_ipv4: "127.0.0.1"
-  log_level: info`;
-                 await fs.writeFile(configPath, emergencyConfig);
-                 stream("✅ Healer: Emergency config.yaml injected.", "success");
-             }
-        }
-
+        // --- CONTEXT SANITIZER (Universal) ---
+        // Ensures hidden config files (like .env or config.yaml) are NOT ignored by Docker
         stream("🛡️ Sanitizing Build Context...", "info");
         const dockerIgnorePath = path.join(targetDir, '.dockerignore');
         try {
             await fs.rm(dockerIgnorePath, { force: true });
+            // Whitelist-style ignore (Allow everything, ignore specific heavy junk)
             await fs.writeFile(dockerIgnorePath, `
 .git
 node_modules
 dist
-.env
             `.trim());
         } catch (e) { }
 
         stream("Registering app...", "info");
         try {
             const createProc = execa(flyExe, ['apps', 'create', appName], { env: DEPLOY_ENV });
-            if (createProc.stdout) createProc.stdout.on('data', d => stream(`[Reg] ${d.toString().trim()}`, 'log'));
             await createProc;
         } catch (e) {
             const err = (e.stderr || '') + (e.stdout || '');
