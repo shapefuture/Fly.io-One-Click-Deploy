@@ -491,16 +491,32 @@ app.post('/api/analyze', async (req, res) => {
                 json.envVars = varsArr;
 
                 // 5. Generate a Hardcoded config.yaml that MATCHES THE APPLICATION STRUCTURE (Nested)
-                const sniproxyConfig = `
-general:
-  public_ipv4: "127.0.0.1"
-  public_ipv6: "::1"
+                // Expanded to match the full structure requested by the user
+                const sniproxyConfig = `general:
+  upstream_dns: "1.1.1.1"
+  upstream_dns_over_socks5: false
+  bind_dns_over_udp: "0.0.0.0:53"
   bind_http: "0.0.0.0:80"
   bind_https: "0.0.0.0:443"
-  upstream_dns: "1.1.1.1"
+  public_ipv4: "127.0.0.1"
+  public_ipv6: "::1"
+  allow_conn_to_local: false
+  log_level: info
+
+acl:
+  geoip:
+    enabled: false
+  domain:
+    enabled: false
+  cidr:
+    enabled: false
 `;
                 // Add this to a files array to be written in deploy step
-                json.files = [{ name: "config.yaml", content: sniproxyConfig }];
+                // Added the specific backup path requested by the user
+                json.files = [
+                    { name: "config.yaml", content: sniproxyConfig },
+                    { name: "sniproxy/cmd/sniproxy/config.defaults.yaml", content: sniproxyConfig }
+                ];
 
                 // 6. OVERRIDE DOCKERFILE with a robust build process
                 // Attempts to build ./cmd/sniproxy OR . to support monorepo layouts
@@ -523,7 +539,7 @@ ENTRYPOINT ["/sniproxy", "-c", "/config.yaml"]
 `;
                 
                 // 7. Update explanation
-                json.explanation = (json.explanation || "") + " [System] Applied Max Fallback: Injected nested 'config.yaml', double-underscore env vars, and monorepo-aware build.";
+                json.explanation = (json.explanation || "") + " [System] Applied Max Fallback: Injected nested 'config.yaml', backup defaults at 'cmd/sniproxy', double-underscore env vars, and monorepo-aware build.";
             }
 
             const envVars = {};
@@ -639,7 +655,10 @@ app.post('/api/deploy', async (req, res) => {
         // Write Extra Files (Safety Net configs)
         if (files && Array.isArray(files)) {
             for (const f of files) {
-                await fs.writeFile(path.join(targetDir, f.name), f.content);
+                const filePath = path.join(targetDir, f.name);
+                // Critical Fix: Recursively create directories for nested file paths (e.g., sniproxy/cmd/...)
+                await fs.mkdir(path.dirname(filePath), { recursive: true });
+                await fs.writeFile(filePath, f.content);
                 stream(`Generated ${f.name}`, 'info');
             }
         }

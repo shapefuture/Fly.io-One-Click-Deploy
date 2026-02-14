@@ -26,6 +26,7 @@ interface DeployState {
     stack: string;
     healthCheckPath?: string;
     sources: Array<{ title: string; uri: string }>;
+    files?: Array<{ name: string; content: string }>;
   } | null;
   logs: Array<{ message: string; type: 'info' | 'log' | 'error' | 'success' | 'warning' }>;
   deployedUrl: string | null;
@@ -99,7 +100,8 @@ export const useDeployStore = create<DeployState>()(
             body: JSON.stringify({
               sessionId, flyToken, appName, region, repoUrl, githubToken, preferExistingConfig,
               flyToml: generatedConfig?.fly_toml,
-              dockerfile: generatedConfig?.dockerfile
+              dockerfile: generatedConfig?.dockerfile,
+              files: generatedConfig?.files
             })
           });
 
