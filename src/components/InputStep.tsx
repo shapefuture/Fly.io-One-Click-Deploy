@@ -3,6 +3,30 @@ import { useDeployStore } from '../store/deployStore';
 import { GlassCard } from './GlassCard';
 import { Github, Key, Globe, ArrowRight, Loader2, Info, Bot, Settings2, RefreshCw, Code, Copy, Check } from 'lucide-react';
 
+const normalizeRepoUrl = (input: string) => {
+  const trimmed = input.trim();
+  if (trimmed.startsWith('http')) return trimmed;
+  if (trimmed.match(/^[a-zA-Z0-9-]+\/[a-zA-Z0-9-._]+$/)) {
+    return `https://github.com/${trimmed}`;
+  }
+  return trimmed;
+};
+
+const generateAppNameFromUrl = (url: string) => {
+    try {
+        const finalUrl = normalizeRepoUrl(url);
+        if (!finalUrl.includes('/')) return '';
+        
+        const repoName = finalUrl.split('/').pop()?.replace('.git', '') || 'app';
+        const randomSuffix = Math.floor(Math.random() * 10000);
+        return `${repoName.toLowerCase().replace(/[^a-z0-9-]/g, '-')}-${randomSuffix}`;
+    } catch (e) {
+        return '';
+    }
+};
+
+const BADGE_SVG_URL = "https://raw.githubusercontent.com/shapefuture/bolt.diy/main/flyio-button.svg";
+
 export const InputStep = () => {
   const { repoUrl, flyToken, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setError } = useDeployStore();
   const [isLoading, setIsLoading] = useState(false);
@@ -18,18 +42,14 @@ export const InputStep = () => {
     const params = new URLSearchParams(window.location.search);
     const repoParam = params.get('repo');
     if (repoParam) {
-      setInputs({ repoUrl: repoParam });
+      const generatedName = generateAppNameFromUrl(repoParam);
+      setInputs({ 
+          repoUrl: repoParam,
+          // Only set appName if we managed to generate a valid one
+          ...(generatedName ? { appName: generatedName } : {})
+      });
     }
   }, [setInputs]);
-
-  const normalizeRepoUrl = (input: string) => {
-    const trimmed = input.trim();
-    if (trimmed.startsWith('http')) return trimmed;
-    if (trimmed.match(/^[a-zA-Z0-9-]+\/[a-zA-Z0-9-._]+$/)) {
-      return `https://github.com/${trimmed}`;
-    }
-    return trimmed;
-  };
 
   const fetchOpenRouterModels = async () => {
     setLoadingModels(true);
@@ -59,6 +79,13 @@ export const InputStep = () => {
     }
   }, [aiConfig.provider, showAiSettings]);
 
+  const handleRepoBlur = () => {
+    if (repoUrl && !appName) {
+        const generatedName = generateAppNameFromUrl(repoUrl);
+        if (generatedName) setInputs({ appName: generatedName });
+    }
+  };
+
   const handleAnalyze = async () => {
     setValidationError(null);
     const finalUrl = normalizeRepoUrl(repoUrl);
@@ -80,15 +107,20 @@ export const InputStep = () => {
       return;
     }
 
+    // Final check for app name generation
+    let currentAppName = appName;
+    if (!currentAppName) {
+         currentAppName = generateAppNameFromUrl(finalUrl);
+         if (!currentAppName) {
+            // Fallback if URL parsing failed somehow
+            const randomSuffix = Math.floor(Math.random() * 10000);
+            currentAppName = `fly-app-${randomSuffix}`;
+         }
+         setInputs({ appName: currentAppName });
+    }
+
     setIsLoading(true);
     try {
-      if (!appName) {
-        const repoName = finalUrl.split('/').pop()?.replace('.git', '') || 'app';
-        const randomSuffix = Math.floor(Math.random() * 10000);
-        const name = `${repoName.toLowerCase().replace(/[^a-z0-9-]/g, '-')}-${randomSuffix}`;
-        setInputs({ appName: name });
-      }
-
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -102,6 +134,16 @@ export const InputStep = () => {
         })
       });
       
+      // Robust "RPC-style" error handling
+      // We check content-type before parsing to avoid the "Unexpected token T" error
+      const contentType = res.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+          const text = await res.text();
+          // Extract meaningful error from HTML if possible, otherwise truncate
+          const preview = text.length > 200 ? text.substring(0, 200) + "..." : text;
+          throw new Error(`Backend Error (${res.status}): ${preview}`);
+      }
+
       const data = await res.json();
       
       if (!res.ok) throw new Error(data.error || 'Analysis failed');
@@ -118,7 +160,10 @@ export const InputStep = () => {
       });
       setStep('config');
     } catch (err: any) {
-      setError(err.message);
+      console.error("Analyze Error:", err);
+      // Clean up error message for UI
+      const msg = err.message.replace(/<[^>]*>/g, ''); // Strip HTML tags if any leaked
+      setError(msg || "Failed to analyze repository. The backend service might be unavailable.");
     } finally {
       setIsLoading(false);
     }
@@ -127,8 +172,7 @@ export const InputStep = () => {
   const generateBadgeCode = () => {
     const baseUrl = window.location.origin;
     const targetUrl = repoUrl ? `${baseUrl}?repo=${normalizeRepoUrl(repoUrl)}` : `${baseUrl}?repo=YOUR_GITHUB_URL`;
-    const badgeImage = "https://raw.githubusercontent.com/shapefuture/bolt.diy/main/flyio-button.svg";
-    return `[![Deploy to Fly.io](${badgeImage})](${targetUrl})`;
+    return `[![Deploy to Fly.io](${BADGE_SVG_URL})](${targetUrl})`;
   };
 
   const copyBadge = () => {
@@ -155,11 +199,16 @@ export const InputStep = () => {
       </div>
 
       {showBadgeGenerator && (
-         <div className="p-4 bg-blue-500/10 border border-blue-500/20 rounded-xl space-y-3 animate-fade-in-up">
+         <div className="p-4 bg-blue-500/10 border border-blue-500/20 rounded-xl space-y-4 animate-fade-in-up">
             <div className="flex items-center justify-between">
                 <h3 className="text-sm font-bold text-blue-200">One-Click Deploy Button</h3>
                 <span className="text-[10px] text-blue-300/60 uppercase tracking-wider">Markdown</span>
             </div>
+            
+            <div className="flex justify-center py-2">
+                <img src={BADGE_SVG_URL} alt="Deploy to Fly.io" className="h-8 hover:scale-105 transition-transform cursor-pointer" title="Preview of the badge" />
+            </div>
+
             <p className="text-xs text-blue-200/70">Add this to your README.md to let others deploy this repo instantly.</p>
             <div className="flex gap-2">
                 <code className="flex-1 bg-black/40 text-slate-300 p-3 rounded-lg text-xs font-mono break-all border border-white/5">
@@ -182,6 +231,7 @@ export const InputStep = () => {
             type="text"
             value={repoUrl}
             onChange={(e) => setInputs({ repoUrl: e.target.value })}
+            onBlur={handleRepoBlur}
             placeholder="username/repo or https://github.com/..."
             className="w-full bg-black/50 border border-white/10 rounded-lg px-4 py-3 text-white placeholder:text-slate-600 focus:outline-none focus:border-blue-500 transition-colors"
           />
