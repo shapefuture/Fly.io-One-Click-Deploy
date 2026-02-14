@@ -23,7 +23,7 @@
     "zustand": "^4.5.0",
     "openai": "^4.28.4",
     "simple-git": "^3.24.0",
-    "google-genai": "1.63.0"
+    "@google/genai": "^1.41.0"
   },
   "devDependencies": {
     "@types/react": "^18.2.56",

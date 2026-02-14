@@ -9,7 +9,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import simpleGit from 'simple-git';
 import { v4 as uuidv4 } from 'uuid';
-import { GoogleGenAI, Type } from "google-genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import OpenAI from 'openai';
 import { pipeline } from 'stream/promises';
 
