@@ -263,7 +263,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.post('/api/analyze', async (req, res) => {
-    const { repoUrl, aiConfig, githubToken, preferExistingConfig } = req.body;
+    const { repoUrl, aiConfig, githubToken, preferExistingConfig, appName } = req.body;
     const sessionId = uuidv4();
     const workDir = path.join(TEMP_DIR, sessionId);
     await fs.mkdir(workDir, { recursive: true }).catch(() => {});
@@ -287,7 +287,7 @@ app.post('/api/analyze', async (req, res) => {
             for (const f of files) {
                 try { c += `\n${f}:\n` + await fs.readFile(path.join(repoPath, f), 'utf8'); } catch {}
             }
-            return c.slice(0, 8000);
+            return c.slice(8000);
         })();
 
         const hasDockerfile = context.includes("Dockerfile:");
@@ -295,32 +295,30 @@ app.post('/api/analyze', async (req, res) => {
         const prompt = `DevOps Task: Config for Fly.io. Repo: ${repoUrl}. Context: ${context}. Return JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}.
         CRITICAL RULES:
         1. fly.toml strings MUST use SINGLE QUOTES.
-        2. [[vm]] section MUST include BOTH: memory = '1gb' AND memory_mb = 1024.
+        2. [[vm]] section MUST include BOTH: memory = '1gb' AND memory_mb = 256.
         3. If Dockerfile exists, set 'dockerfile' to null.
         4. If generating Dockerfile, use JSON array syntax for CMD.
         5. Detect 'internal_port' (8080, 3000, 80).
         6. Sniproxy crash fix: override PUBLIC_IP vars.
+        7. PREVENT IDLE STOP: Set auto_stop_machines = false and min_machines_running = 1.
         
         Preferred Structure:
-        app = 'name'
+        app = '${appName || 'name'}'
         primary_region = 'iad'
-        [build]
-        dockerfile = 'Dockerfile'
+        [http_service]
+          internal_port = 8080
+          force_https = true
+          auto_stop_machines = false
+          auto_start_machines = true
+          min_machines_running = 1
         [[vm]]
         memory = '1gb'
         cpu_kind = 'shared'
         cpus = 1
         memory_mb = 256
-        [[services]]
-        internal_port = 8080
-        protocol = 'tcp'
         [[services.ports]]
             port = 443
             handlers = ['tls', 'http']
-        [[services.checks]]
-            type = 'tcp'
-            interval = '10s'
-            timeout = '2s'
         `;
 
         try {
@@ -347,6 +345,24 @@ app.post('/api/analyze', async (req, res) => {
             }
             
             if (hasDockerfile) json.dockerfile = null;
+
+            // --- FORCE APP NAME & PREVENT IDLE STOP ---
+            if (json.fly_toml) {
+                if (appName) {
+                    if (/^app\s*=/m.test(json.fly_toml)) {
+                        json.fly_toml = json.fly_toml.replace(/^app\s*=.*$/m, `app = '${appName}'`);
+                    } else {
+                        json.fly_toml = `app = '${appName}'\n` + json.fly_toml;
+                    }
+                }
+                
+                // Enforce persistence logic: if auto_stop_machines is true, force to false
+                json.fly_toml = json.fly_toml.replace(/auto_stop_machines\s*=\s*true/g, "auto_stop_machines = false");
+                json.fly_toml = json.fly_toml.replace(/min_machines_running\s*=\s*0/g, "min_machines_running = 1");
+                
+                // If it doesn't exist, we might rely on the [http_service] being present or user will check it.
+                // The AI prompt encourages [http_service] with correct values.
+            }
 
             // --- SAFETY NET FOR SNIPROXY ---
             if (repoUrl.toLowerCase().includes('sniproxy')) {
@@ -492,7 +508,9 @@ app.post('/api/deploy', async (req, res) => {
             tomlContent.replace(/^app\s*=.*$/gm, '')
                        .replace(/^primary_region\s*=.*$/gm, '')
                        .replace(/^checks\s*=\s*".*"/gm, '')
-                       .replace(/^checks\s*=\s*'.*'/gm, ''); 
+                       .replace(/^checks\s*=\s*'.*'/gm, '')
+                       .replace(/auto_stop_machines\s*=\s*true/g, "auto_stop_machines = false")
+                       .replace(/min_machines_running\s*=\s*0/g, "min_machines_running = 1");
             
         await fs.writeFile(tomlPath, tomlContent);
         

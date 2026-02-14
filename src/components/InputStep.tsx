@@ -147,6 +147,7 @@ export const InputStep = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           repoUrl: finalUrl,
+          appName: currentAppName,
           githubToken,
           preferExistingConfig,
           aiConfig: {
