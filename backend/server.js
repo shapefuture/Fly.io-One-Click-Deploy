@@ -346,46 +346,49 @@ app.post('/api/analyze', async (req, res) => {
             return c.slice(0, 8000);
         })();
 
-        // STRICT PROMPT: Enforcing the 'Combined' structure
+        // STRICT PROMPT: Enforcing the 'Combined' structure with SINGLE QUOTES
         const prompt = `DevOps Task: Config for Fly.io. Repo: ${repoUrl}. Context: ${context}. Return JSON: {fly_toml, dockerfile, explanation, envVars:[{name, reason}], stack, healthCheckPath}.
         
         CRITICAL RULES for fly.toml:
-        1. Do NOT use a string for 'checks'. Example BAD: checks = "string".
-        2. Use explicit [[services]] definitions for ports.
-        3. Combine robust VM settings (auto_start/stop, shared cpu) with specific service checks.
+        1. USE SINGLE QUOTES (') for strings, not double quotes.
+        2. Do NOT use a string for 'checks'.
+        3. Use explicit [[services]] definitions for ports.
+        4. Combine robust VM settings (auto_start/stop, shared cpu) with specific service checks.
+        5. Ensure [[vm]] section includes BOTH: memory = '1gb' AND memory_mb = 256.
         
         Preferred fly.toml Structure:
-        app = "app"
-        primary_region = "iad"
+        app = 'app'
+        primary_region = 'iad'
 
         [build]
-        dockerfile = "Dockerfile"
+        dockerfile = 'Dockerfile'
 
         [[vm]]
-        cpu_kind = "shared"
+        memory = '1gb'
+        cpu_kind = 'shared'
         cpus = 1
         memory_mb = 256
 
         [[services]]
-        internal_port = 8080 # or detected port
-        protocol = "tcp"
+        internal_port = 8080
+        protocol = 'tcp'
         auto_stop_machines = true
         auto_start_machines = true
         min_machines_running = 1
         
         [[services.ports]]
             port = 80
-            handlers = ["http"]
+            handlers = ['http']
         [[services.ports]]
             port = 443
-            handlers = ["tls", "http"]
+            handlers = ['tls', 'http']
         
         [[services.checks]]
-            type = "http"
-            path = "/"
-            interval = "10s"
-            timeout = "2s"
-            grace_period = "5s"
+            type = 'http'
+            path = '/'
+            interval = '10s'
+            timeout = '2s'
+            grace_period = '5s'
         `;
 
         try {
@@ -396,7 +399,7 @@ app.post('/api/analyze', async (req, res) => {
                 const openai = new OpenAI({ baseURL: 'https://openrouter.ai/api/v1', apiKey: aiConfig.apiKey });
                 const completion = await openai.chat.completions.create({
                     model: aiConfig.model || 'google/gemini-2.0-flash-exp:free',
-                    messages: [{ role: 'system', content: 'JSON only. Valid TOML.' }, { role: 'user', content: prompt }],
+                    messages: [{ role: 'system', content: 'JSON only. Valid TOML. Single quotes.' }, { role: 'user', content: prompt }],
                     response_format: { type: 'json_object' }
                 });
                 json = JSON.parse(completion.choices[0].message.content);
@@ -419,38 +422,39 @@ app.post('/api/analyze', async (req, res) => {
             console.error("AI Error:", e);
             res.json({
                 success: true, sessionId,
-                // FALLBACK: The "Combined" config requested by user
-                fly_toml: `app = "app"
-primary_region = "iad"
+                // FALLBACK: The "Combined" config requested by user (SINGLE QUOTES)
+                fly_toml: `app = 'app'
+primary_region = 'iad'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [[vm]]
-  cpu_kind = "shared"
+  memory = '1gb'
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 256
 
 [[services]]
   internal_port = 8080
-  protocol = "tcp"
+  protocol = 'tcp'
   auto_stop_machines = true
   auto_start_machines = true
   min_machines_running = 1
   
   [[services.ports]]
     port = 80
-    handlers = ["http"]
+    handlers = ['http']
   [[services.ports]]
     port = 443
-    handlers = ["tls", "http"]
+    handlers = ['tls', 'http']
     
   [[services.checks]]
-    type = "http"
-    path = "/"
-    interval = "10s"
-    timeout = "2s"
-    grace_period = "5s"
+    type = 'http'
+    path = '/'
+    interval = '10s'
+    timeout = '2s'
+    grace_period = '5s'
 `,
                 dockerfile: 'FROM node:18-alpine\nWORKDIR /app\nCOPY . .\nRUN npm ci\nCMD ["npm", "start"]',
                 explanation: "Fallback config used (Combined Format).",
@@ -516,13 +520,14 @@ app.post('/api/deploy', async (req, res) => {
         }
         
         // Sanitize TOML (CRITICAL FIX FOR 'checks' ERROR)
-        // 1. Force app name and region
+        // 1. Force app name and region (SINGLE QUOTES)
         // 2. Remove existing app/region keys
         // 3. Remove invalid top-level checks="string" which breaks flyctl
-        tomlContent = `app = "${appName}"\nprimary_region = "${region}"\n` + 
+        tomlContent = `app = '${appName}'\nprimary_region = '${region}'\n` + 
             tomlContent.replace(/^app\s*=.*$/gm, '')
                        .replace(/^primary_region\s*=.*$/gm, '')
-                       .replace(/^checks\s*=\s*".*"/gm, ''); 
+                       .replace(/^checks\s*=\s*".*"/gm, '')
+                       .replace(/^checks\s*=\s*'.*'/gm, ''); 
             
         await fs.writeFile(tomlPath, tomlContent);
         if (dockerfile) await fs.writeFile(path.join(targetDir, 'Dockerfile'), dockerfile);
