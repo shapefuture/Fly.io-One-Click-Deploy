@@ -383,6 +383,13 @@ app.post('/api/analyze', async (req, res) => {
         [[services.ports]]
             port = 443
             handlers = ['tls', 'http']
+
+        [[services.checks]]
+            type = 'http'
+            path = '/'
+            interval = '10s'
+            timeout = '2s'
+            grace_period = '5s'
         `;
 
         try {
@@ -447,6 +454,13 @@ primary_region = 'iad'
   [[services.ports]]
     port = 443
     handlers = ['tls', 'http']
+
+  [[services.checks]]
+    type = 'http'
+    path = '/'
+    interval = '10s'
+    timeout = '2s'
+    grace_period = '5s'
 `,
                 // Don't overwrite if it exists
                 dockerfile: hasDockerfile ? null : 'FROM node:18-alpine\nWORKDIR /app\nCOPY . .\nRUN npm ci\nCMD ["npm", "start"]',
