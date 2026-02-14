@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useDeployStore } from '../store/deployStore';
 import { GlassCard } from './GlassCard';
-import { Github, Key, Globe, ArrowRight, Loader2, Info, Bot, Settings2, RefreshCw, Code, Copy, Check, FileCheck } from 'lucide-react';
+import { Github, Key, Globe, ArrowRight, Loader2, Info, Bot, Settings2, RefreshCw, Code, Copy, Check, AlertTriangle } from 'lucide-react';
 
 const normalizeRepoUrl = (input: string) => {
   const trimmed = input.trim();
@@ -27,21 +27,6 @@ const generateAppNameFromUrl = (url: string) => {
 
 const BADGE_SVG_URL = "https://raw.githubusercontent.com/shapefuture/bolt.diy/main/flyio-button.svg";
 
-// Helper for robust health check
-const checkBackendHealth = async (retries = 3, delay = 1000): Promise<boolean> => {
-    for (let i = 0; i < retries; i++) {
-        try {
-            const res = await fetch('/api/health');
-            if (res.ok) return true;
-        } catch (e) {
-            console.log(`Health check attempt ${i + 1} failed, retrying in ${delay}ms...`);
-        }
-        await new Promise(resolve => setTimeout(resolve, delay));
-        delay *= 1.5; // Exponential backoff
-    }
-    return false;
-};
-
 export const InputStep = () => {
   const { repoUrl, flyToken, githubToken, preferExistingConfig, appName, region, aiConfig, setInputs, setAiConfig, setStep, setSessionId, setConfig, setError, deployApp } = useDeployStore();
   const [isLoading, setIsLoading] = useState(false);
@@ -51,6 +36,7 @@ export const InputStep = () => {
   const [openRouterModels, setOpenRouterModels] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [backendStatus, setBackendStatus] = useState<'checking' | 'ok' | 'error'>('checking');
 
   // One-Click Deploy Logic: Parse URL params
   useEffect(() => {
@@ -60,18 +46,29 @@ export const InputStep = () => {
       const generatedName = generateAppNameFromUrl(repoParam);
       setInputs({ 
           repoUrl: repoParam,
-          // Only set appName if we managed to generate a valid one
           ...(generatedName ? { appName: generatedName } : {})
       });
     }
+
+    // Health check on mount
+    checkHealth();
   }, [setInputs]);
+
+  const checkHealth = async () => {
+      try {
+          const res = await fetch('/api/health');
+          if (res.ok) setBackendStatus('ok');
+          else setBackendStatus('error');
+      } catch (e) {
+          setBackendStatus('error');
+      }
+  };
 
   const fetchOpenRouterModels = async () => {
     setLoadingModels(true);
     try {
       const res = await fetch('https://openrouter.ai/api/v1/models');
       const data = await res.json();
-      // Filter for free models (pricing.prompt === "0")
       const freeModels = data.data
         .filter((m: any) => m.pricing?.prompt === "0" && m.pricing?.completion === "0")
         .map((m: any) => m.id)
@@ -102,6 +99,14 @@ export const InputStep = () => {
   };
 
   const handleAnalyze = async () => {
+    if (backendStatus === 'error') {
+        await checkHealth();
+        if (backendStatus === 'error') {
+            setValidationError("Backend server is unreachable. Ensure 'node backend/server.js' is running.");
+            return;
+        }
+    }
+
     setValidationError(null);
     const finalUrl = normalizeRepoUrl(repoUrl);
     
@@ -116,18 +121,15 @@ export const InputStep = () => {
 
     if (finalUrl !== repoUrl) setInputs({ repoUrl: finalUrl });
 
-    // Validate AI Config if using BYOK
     if (aiConfig.provider === 'openrouter' && !aiConfig.apiKey) {
       setValidationError("OpenRouter API Key is required when OpenRouter provider is selected.");
       return;
     }
 
-    // Final check for app name generation
     let currentAppName = appName;
     if (!currentAppName) {
          currentAppName = generateAppNameFromUrl(finalUrl);
          if (!currentAppName) {
-            // Fallback if URL parsing failed somehow
             const randomSuffix = Math.floor(Math.random() * 10000);
             currentAppName = `fly-app-${randomSuffix}`;
          }
@@ -136,12 +138,6 @@ export const InputStep = () => {
 
     setIsLoading(true);
     try {
-      // Diagnostic Health Check with Retry
-      const isHealthy = await checkBackendHealth(5, 500);
-      if (!isHealthy) {
-        throw new Error("Backend server is not reachable after multiple attempts. Please check if the local server is running.");
-      }
-
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -149,19 +145,14 @@ export const InputStep = () => {
           repoUrl: finalUrl,
           githubToken,
           preferExistingConfig,
-          aiConfig: {
-            ...aiConfig,
-            // Don't send empty strings if not set, let backend handle defaults for Gemini
-            model: aiConfig.model || undefined
-          }
+          aiConfig: { ...aiConfig, model: aiConfig.model || undefined }
         })
       });
       
       const contentType = res.headers.get("content-type");
       if (!contentType || !contentType.includes("application/json")) {
           const text = await res.text();
-          const preview = text.length > 200 ? text.substring(0, 200) + "..." : text;
-          throw new Error(`Backend Error (${res.status}): ${preview}`);
+          throw new Error(`Backend Error (${res.status}): ${text.slice(0, 100)}`);
       }
 
       const data = await res.json();
@@ -176,22 +167,19 @@ export const InputStep = () => {
         envVars: data.envVars || {},
         stack: data.stack || 'Unknown',
         healthCheckPath: data.healthCheckPath,
-        sources: data.sources || []
+        sources: data.sources || [],
+        files: data.files || []
       });
 
-      // SHORT CIRCUIT: Auto-deploy if using existing config
       if (preferExistingConfig) {
-          // Trigger deployment immediately
           await deployApp();
-          // State is handled inside deployApp (sets step to 'deploying')
       } else {
           setStep('config');
       }
 
     } catch (err: any) {
       console.error("Analyze Error:", err);
-      const msg = err.message.replace(/<[^>]*>/g, '');
-      setError(msg || "Failed to analyze repository. The backend service might be unavailable.");
+      setError(err.message || "Failed to analyze repository.");
     } finally {
       setIsLoading(false);
     }
@@ -211,6 +199,17 @@ export const InputStep = () => {
 
   return (
     <GlassCard className="w-full max-w-2xl mx-auto space-y-8 animate-fade-in-up">
+      {backendStatus === 'error' && (
+          <div className="bg-red-500/20 border border-red-500/50 p-3 rounded-lg flex items-center gap-3 text-red-200 text-sm animate-pulse">
+              <AlertTriangle className="w-5 h-5 shrink-0" />
+              <div>
+                  <p className="font-bold">Backend Connection Lost</p>
+                  <p className="text-xs opacity-80">Is the server running? Try <code>npm start</code> in the root folder.</p>
+              </div>
+              <button onClick={checkHealth} className="ml-auto bg-red-500/30 px-3 py-1 rounded text-xs hover:bg-red-500/50">Retry</button>
+          </div>
+      )}
+
       <div className="flex justify-between items-start">
         <div className="space-y-2">
             <h2 className="text-2xl font-bold text-white flex items-center gap-2">
@@ -360,7 +359,6 @@ export const InputStep = () => {
           </div>
         </div>
 
-        {/* AI Configuration Toggle */}
         <div className="border-t border-white/5 pt-4">
             <button 
                 onClick={() => setShowAiSettings(!showAiSettings)}
@@ -455,7 +453,7 @@ export const InputStep = () => {
 
       <button
         onClick={handleAnalyze}
-        disabled={!repoUrl || !flyToken || isLoading}
+        disabled={!repoUrl || !flyToken || isLoading || backendStatus === 'error'}
         className="w-full bg-white text-black font-bold py-4 rounded-lg hover:bg-slate-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
       >
         {isLoading ? (

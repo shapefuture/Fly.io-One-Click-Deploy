@@ -8,7 +8,7 @@ import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { v4 as uuidv4 } from 'uuid';
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import OpenAI from 'openai';
 import { createRequire } from 'module';
 import { pipeline } from 'stream/promises';
@@ -54,7 +54,9 @@ async function ensureDirs() {
         await fs.mkdir(VERCEL_HOME, { recursive: true });
         await fs.mkdir(FLY_INSTALL_DIR, { recursive: true });
         await fs.mkdir(path.dirname(FLY_BIN), { recursive: true });
-    } catch (e) {}
+    } catch (e) {
+        console.error("Directory init failed:", e.message);
+    }
 }
 
 async function performAntifragileInstallation() {
@@ -72,35 +74,51 @@ async function performAntifragileInstallation() {
     if (await verify(FLY_BIN)) return FLY_BIN;
 
     const binDir = path.dirname(FLY_BIN);
-    try {
-        await execa('sh', ['-c', 'curl -L https://fly.io/install.sh | sh'], { env: CHILD_ENV, timeout: 45000 });
-        if (await verify(FLY_BIN)) return FLY_BIN;
-    } catch (e) {}
+    
+    // Strategy 1: Shell script (Linux/Mac only)
+    if (!IS_WINDOWS) {
+        try {
+            await execa('sh', ['-c', 'curl -L https://fly.io/install.sh | sh'], { env: CHILD_ENV, timeout: 45000 });
+            if (await verify(FLY_BIN)) return FLY_BIN;
+        } catch (e) {}
+    }
 
     // Strategy 2: Manual download
     const platform = os.platform();
     const osName = platform === 'darwin' ? 'macOS' : platform === 'win32' ? 'Windows' : 'Linux';
     const archName = os.arch() === 'arm64' ? 'arm64' : 'x86_64';
     const version = "0.4.11";
-    const fileName = `flyctl_${version}_${osName}_${archName}.tar.gz`;
+    // Fix: Correct extension for Windows
+    const ext = IS_WINDOWS ? '.zip' : '.tar.gz';
+    const fileName = `flyctl_${version}_${osName}_${archName}${ext}`;
     const url = `https://github.com/superfly/flyctl/releases/download/v${version}/${fileName}`;
     
-    const tmpPath = path.join(VERCEL_HOME, `fly_dl_${uuidv4()}.tar.gz`);
+    const tmpPath = path.join(VERCEL_HOME, `fly_dl_${uuidv4()}${ext}`);
+    console.log(`Downloading Flyctl from: ${url}`);
+    
     const response = await fetch(url);
     if (response.ok) {
         await pipeline(response.body, createWriteStream(tmpPath));
-        if (tar) await tar.x({ file: tmpPath, cwd: binDir });
-        else await execa('tar', ['-xzf', tmpPath, '-C', binDir], { env: CHILD_ENV });
         
+        if (ext === '.zip') {
+             const zip = new AdmZip(tmpPath);
+             zip.extractAllTo(binDir, true);
+        } else {
+             if (tar) await tar.x({ file: tmpPath, cwd: binDir });
+             else await execa('tar', ['-xzf', tmpPath, '-C', binDir], { env: CHILD_ENV });
+        }
+        
+        // Flatten structure if needed and find binary
         const list = await fs.readdir(binDir);
         for (const f of list) {
-            if (f === BIN_NAME) {
-                 if (!IS_WINDOWS) await fs.chmod(path.join(binDir, f), 0o755).catch(() => {});
-                 return path.join(binDir, f);
-            }
+             const fPath = path.join(binDir, f);
+             if (f === BIN_NAME) {
+                 if (!IS_WINDOWS) await fs.chmod(fPath, 0o755).catch(() => {});
+                 return fPath;
+             }
         }
     }
-    throw new Error("Fly install failed");
+    throw new Error(`Fly install failed. URL: ${url}`);
 }
 
 async function getFlyExe() {
@@ -112,6 +130,7 @@ async function getFlyExe() {
             return p;
         }).catch(e => {
             installationPromise = null;
+            lastInstallError = e.message;
             throw e;
         });
     }
@@ -130,6 +149,15 @@ async function downloadRepo(repoUrl, targetDir, githubToken) {
     const root = list.find(n => !n.startsWith('.'));
     return root && (await fs.stat(path.join(targetDir, root))).isDirectory() ? path.join(targetDir, root) : targetDir;
 }
+
+app.get('/api/health', (req, res) => {
+    res.json({ 
+        status: 'ok', 
+        flyInstalled: !!flyBinPath, 
+        lastError: lastInstallError,
+        env: IS_VERCEL ? 'vercel' : 'node'
+    });
+});
 
 app.post('/api/analyze', async (req, res) => {
     const { repoUrl, aiConfig, githubToken, preferExistingConfig } = req.body;
@@ -172,16 +200,18 @@ acl:
   domain: { enabled: false }
   cidr: { enabled: false }`;
 
+            // Fix: Add both root config AND nested backup config as requested
             json.files = [
                 { name: "config.yaml", content: sniproxyConfig },
                 { name: "sniproxy/cmd/sniproxy/config.defaults.yaml", content: sniproxyConfig }
             ];
 
-            // Multi-Stage Copy Dockerfile (Bypasses host context issues)
+            // Robust Dockerfile for Monorepo + Config Injection
             json.dockerfile = `FROM golang:alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache git
 COPY . .
+# Try to build from specific cmd path first, else root
 RUN if [ -d "./cmd/sniproxy" ]; then \
       go build -ldflags "-s -w" -o /sniproxy ./cmd/sniproxy; \
     else \
@@ -190,20 +220,23 @@ RUN if [ -d "./cmd/sniproxy" ]; then \
 
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates
-COPY --from=builder /sniproxy /sniproxy
-# Copy the config from the BUILDER stage instead of the HOST context
+# Inject config into the builder stage to ensure it exists in context
 COPY --from=builder /app/config.yaml /config.yaml
-# Ensure nested path exists for defaults
+# Copy binary
+COPY --from=builder /sniproxy /sniproxy
+# Ensure directory exists for nested config backup
 RUN mkdir -p /sniproxy/cmd/sniproxy/
+# Copy the backup config to the requested path
 COPY --from=builder /app/sniproxy/cmd/sniproxy/config.defaults.yaml /sniproxy/cmd/sniproxy/config.defaults.yaml
 ENTRYPOINT ["/sniproxy", "-c", "/config.yaml"]`;
 
+            // Hardcode Env Vars for Safety
             json.envVars = [
                 { name: "SNIPROXY_GENERAL__PUBLIC_IPV4", reason: "Fix bind error" },
                 { name: "SNIPROXY_GENERAL__BIND_HTTP", reason: "Force bind 80" }
             ];
 
-            // Force fly.toml to use TCP checks
+            // Force TCP checks
             json.fly_toml = `app = 'app'
 primary_region = 'iad'
 [build]
@@ -248,10 +281,9 @@ app.post('/api/deploy', async (req, res) => {
         stream("Preparing workspace...", "info");
         const targetDir = await downloadRepo(repoUrl, workDir, githubToken);
 
-        // --- THE BYPASS: NUCLEAR .DOCKERIGNORE OVERRIDE ---
-        // Delete any existing .dockerignore to ensure our generated files are NEVER ignored
+        // --- BYPASS: NUCLEAR .DOCKERIGNORE OVERRIDE ---
+        // Critical: Delete existing .dockerignore so it doesn't block our injected configs
         await fs.rm(path.join(targetDir, '.dockerignore'), { force: true });
-        // Create a safety-net .dockerignore that only blocks node_modules
         await fs.writeFile(path.join(targetDir, '.dockerignore'), 'node_modules\n.git\n');
 
         stream("Writing configurations...", "info");
@@ -261,6 +293,7 @@ app.post('/api/deploy', async (req, res) => {
         if (files) {
             for (const f of files) {
                 const fPath = path.join(targetDir, f.name);
+                // Ensure parent directories exist
                 await fs.mkdir(path.dirname(fPath), { recursive: true });
                 await fs.writeFile(fPath, f.content);
                 stream(`Generated ${f.name}`, "info");
@@ -269,8 +302,10 @@ app.post('/api/deploy', async (req, res) => {
 
         stream("Launching deployment...", "log");
         const proc = execa(flyExe, ['deploy', '--ha=false', '--remote-only', '--yes'], { cwd: targetDir, env: DEPLOY_ENV });
+        
         proc.stdout.on('data', d => stream(d.toString(), 'log'));
         proc.stderr.on('data', d => stream(d.toString(), 'log'));
+        
         await proc;
 
         res.write(`data: ${JSON.stringify({ type: 'success', appUrl: `https://${appName}.fly.dev`, appName })}\n\n`);
@@ -278,6 +313,17 @@ app.post('/api/deploy', async (req, res) => {
     res.end();
 });
 
-ensureDirs();
-if (!IS_VERCEL) app.listen(port, () => console.log(`Server on ${port}`));
+// Startup logic with error handling
+(async () => {
+    try {
+        await ensureDirs();
+        if (!IS_VERCEL) {
+            app.listen(port, '0.0.0.0', () => console.log(`🚀 Backend Server ready on port ${port}`));
+        }
+    } catch (e) {
+        console.error("FATAL STARTUP ERROR:", e);
+        process.exit(1);
+    }
+})();
+
 export default app;
