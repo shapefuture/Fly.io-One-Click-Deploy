@@ -6,14 +6,13 @@ import fs from 'fs/promises';
 import { existsSync } from 'fs';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
+import toml from '@iarna/toml';
 
 import { TEMP_DIR, VERCEL_HOME, FLY_INSTALL_DIR, IS_VERCEL, IS_WINDOWS } from './lib/config.js';
 import { getFlyExe, getFlyInstallState } from './lib/installer.js';
 import { downloadRepo } from './lib/git.js';
 import { StackDetector } from './lib/stack-detector.js';
 import { PolicyEngine } from './lib/policy.js';
-
-console.log('🚀 Starting Backend Server...');
 
 dotenv.config();
 
@@ -31,6 +30,17 @@ process.on('unhandledRejection', (reason, promise) => {
 
 app.use(cors());
 app.use(express.json());
+
+// --- SECURITY HELPERS ---
+const isValidAppName = (name) => /^[a-z0-9-]+$/.test(name);
+const isValidRepoUrl = (url) => /^https?:\/\/(www\.)?github\.com\/[a-zA-Z0-9-]+\/[a-zA-Z0-9-._]+$/.test(url);
+
+const sanitizeLog = (msg) => {
+    if (!process.env.FLY_API_TOKEN && !process.env.OPENAI_API_KEY) return msg;
+    let clean = msg;
+    if (process.env.FLY_API_TOKEN) clean = clean.replace(new RegExp(process.env.FLY_API_TOKEN, 'g'), '[REDACTED_TOKEN]');
+    return clean;
+};
 
 // --- INITIALIZATION ---
 async function ensureDirs() {
@@ -59,7 +69,7 @@ async function ensureDirs() {
 // Background install
 (async () => {
     await ensureDirs();
-    if (!IS_VERCEL) getFlyExe().catch(e => console.error("Fly CLI Background Install Failed:", e.message));
+    if (!IS_VERCEL) getFlyExe().catch(() => {});
 })();
 
 async function cleanup(dir) {
@@ -82,6 +92,15 @@ app.get('/api/health', (req, res) => {
 
 app.post('/api/analyze', async (req, res) => {
     const { repoUrl, aiConfig, githubToken, preferExistingConfig, appName } = req.body;
+    
+    // Security Validation
+    if (!isValidRepoUrl(repoUrl)) {
+        return res.status(400).json({ error: "Invalid GitHub Repository URL" });
+    }
+    if (appName && !isValidAppName(appName)) {
+        return res.status(400).json({ error: "Invalid App Name. Use lowercase letters, numbers, and hyphens only." });
+    }
+
     const sessionId = uuidv4();
     const workDir = path.join(TEMP_DIR, sessionId);
     await fs.mkdir(workDir, { recursive: true }).catch(() => {});
@@ -98,7 +117,7 @@ app.post('/api/analyze', async (req, res) => {
         // 3. Execute Strategy
         const result = await strategy.analyze(repoPath, repoUrl, appName, aiConfig, preferExistingConfig);
 
-        // 4. Global Post-Processing (The "Healer")
+        // 4. Global Post-Processing (The "Healer" - Policy Engine)
         if (result.fly_toml) {
             if (appName) {
                 if (/^app\s*=/m.test(result.fly_toml)) {
@@ -138,11 +157,19 @@ app.post('/api/analyze', async (req, res) => {
 app.post('/api/deploy', async (req, res) => {
     const { sessionId, flyToken, flyToml, dockerfile, appName, region, repoUrl, githubToken, preferExistingConfig, files, secrets, healthCheckPath } = req.body;
     
+    // Security Validation
+    if (!isValidRepoUrl(repoUrl)) return res.write(`data: ${JSON.stringify({ message: "Invalid Repo URL", type: 'error' })}\n\n`);
+    if (!isValidAppName(appName)) return res.write(`data: ${JSON.stringify({ message: "Invalid App Name", type: 'error' })}\n\n`);
+
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    const stream = (msg, type = 'info') => res.write(`data: ${JSON.stringify({ message: msg, type })}\n\n`);
+    const stream = (msg, type = 'info') => {
+        const cleanMsg = sanitizeLog(msg);
+        res.write(`data: ${JSON.stringify({ message: cleanMsg, type })}\n\n`);
+    };
+
     const workDir = path.join(TEMP_DIR, sessionId);
 
     try {
@@ -192,6 +219,7 @@ app.post('/api/deploy', async (req, res) => {
              try { tomlContent = await fs.readFile(tomlPath, 'utf8'); } catch { throw new Error("Missing fly.toml"); }
         }
         
+        // Manual cleanup using regex before saving, Policy engine will do more
         tomlContent = `app = '${appName}'\nprimary_region = '${region}'\n` + 
             tomlContent.replace(/^app\s*=.*$/gm, '')
                        .replace(/^primary_region\s*=.*$/gm, '')
@@ -229,13 +257,7 @@ dist
         } catch (e) { }
 
         // --- POLICY ENGINE EXECUTION ---
-        try {
-            if (PolicyEngine && PolicyEngine.apply) {
-                await PolicyEngine.apply(targetDir, appName, region, stream);
-            }
-        } catch (e) {
-            stream(`⚠️ Policy Engine check failed (Non-critical): ${e.message}`, 'warning');
-        }
+        await PolicyEngine.apply(targetDir, appName, region, stream);
 
         stream("Registering app...", "info");
         try {
@@ -247,12 +269,27 @@ dist
             if (err.includes('taken') || err.includes('exists')) stream("App exists, updating...", "warning");
         }
         
-        // --- PHASE 2: VOLUME PROVISIONING ---
-        // Parse fly.toml for [mounts] to auto-provision volumes
+        // --- PHASE 2: VOLUME PROVISIONING (ROBUST PARSING) ---
         try {
-            const mountsMatch = tomlContent.match(/\[mounts\][\s\S]*?source\s*=\s*['"]?([^'"\s]+)['"]?/);
-            if (mountsMatch && mountsMatch[1]) {
-                const volName = mountsMatch[1];
+            // Robust parsing with @iarna/toml
+            let volName = null;
+            try {
+                const parsedToml = toml.parse(tomlContent);
+                if (parsedToml.mounts) {
+                    // Handle both array [[mounts]] and section [mounts]
+                    const mountConfig = Array.isArray(parsedToml.mounts) ? parsedToml.mounts[0] : parsedToml.mounts;
+                    if (mountConfig && mountConfig.source) {
+                        volName = mountConfig.source;
+                    }
+                }
+            } catch (parseErr) {
+                console.warn("TOML Parse Warning (Volume Check):", parseErr.message);
+                // Fallback to regex if TOML is malformed but potentially valid for Fly
+                const mountsMatch = tomlContent.match(/\[mounts\][\s\S]*?source\s*=\s*['"]?([^'"\s]+)['"]?/);
+                if (mountsMatch && mountsMatch[1]) volName = mountsMatch[1];
+            }
+
+            if (volName) {
                 stream(`📦 Detected Volume Request: '${volName}'`, 'info');
                 
                 // Check if volume exists
@@ -330,28 +367,15 @@ dist
              let healthy = false;
              for (let i = 0; i < 5; i++) { // Try for ~25 seconds (5 * 5s)
                  try {
-                     const healthRes = await fetch(url).catch(e => {
-                         if (e.cause?.code === 'DEPTH_ZERO_SELF_SIGNED_CERT' || e.message.includes('certificate')) {
-                             return { ok: true, status: 200, note: "Self-Signed Cert Detected" };
-                         }
-                         throw e;
-                     });
-
-                     if (healthRes.ok || healthRes.status === 404 || healthRes.status === 403 || (healthRes as any).note) {
+                     const healthRes = await fetch(url);
+                     if (healthRes.ok) {
                          healthy = true;
-                         const statusMsg = (healthRes as any).note || healthRes.status;
-                         stream(`✅ Health check passed (${statusMsg})`, 'success');
+                         stream(`✅ Health check passed (${healthRes.status})`, 'success');
                          break;
                      } else {
                          stream(`Health check pending (${healthRes.status})...`, 'log');
                      }
                  } catch (e) {
-                     const errStr = e.message || '';
-                     if (errStr.includes('certificate') || errStr.includes('DEPTH_ZERO_SELF_SIGNED_CERT')) {
-                         healthy = true;
-                         stream(`✅ Health check passed (Self-Signed Cert Detected)`, 'success');
-                         break;
-                     }
                      stream(`Waiting for DNS propagation...`, 'log');
                  }
                  await new Promise(r => setTimeout(r, 5000));
@@ -365,7 +389,8 @@ dist
         res.write(`data: ${JSON.stringify({ type: 'success', appUrl: `https://${status.Hostname}`, appName: status.Name })}\n\n`);
 
     } catch (e) {
-        stream(`Error: ${e.message}`, 'error');
+        const safeError = sanitizeLog(e.message);
+        stream(`Error: ${safeError}`, 'error');
     } finally {
         await cleanup(workDir);
         res.end();

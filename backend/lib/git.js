@@ -1,18 +1,10 @@
 import fs from 'fs/promises';
 import { existsSync } from 'fs';
 import path from 'path';
+import tar from 'tar';
 import { Readable } from 'stream';
 
 export async function downloadRepo(repoUrl, targetDir, githubToken) {
-    // Dynamic import to prevent top-level crash if 'tar' is missing
-    let tar;
-    try {
-        const tarModule = await import('tar');
-        tar = tarModule.default || tarModule;
-    } catch (e) {
-        throw new Error("Dependency 'tar' is missing. Please run 'npm install' in backend.");
-    }
-
     const cleanUrl = repoUrl.replace(/\.git$/, '').replace(/\/$/, '');
     const archiveUrl = `${cleanUrl}/archive/HEAD.tar.gz`;
     const headers = githubToken ? { 'Authorization': `token ${githubToken}` } : {};

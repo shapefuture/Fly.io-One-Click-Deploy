@@ -2,6 +2,7 @@ export const ProxyStrategy = {
     name: "ProxyStrategy",
     
     detect: (repoPath, repoUrl) => {
+        // Phase 1: Keep existing heuristic
         return repoUrl.toLowerCase().includes('sniproxy');
     },
 

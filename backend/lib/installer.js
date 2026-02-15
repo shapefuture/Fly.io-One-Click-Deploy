@@ -6,31 +6,55 @@ import os from 'os';
 import { v4 as uuidv4 } from 'uuid';
 import { pipeline } from 'stream/promises';
 import { createRequire } from 'module';
+import { createHash } from 'crypto';
 import { IS_WINDOWS, IS_VERCEL, BIN_NAME, VERCEL_HOME, FLY_INSTALL_DIR, FLY_BIN } from './config.js';
 
 const require = createRequire(import.meta.url);
+const AdmZip = require('adm-zip');
+
+let tar;
+try {
+    tar = require('tar');
+} catch (e) {
+    console.warn("⚠️ Warning: 'tar' npm package is missing. Fallback to system tar will be used.");
+}
 
 let flyBinPath = null;
 let installationPromise = null;
 let lastInstallError = null;
 
-async function performAntifragileInstallation() {
-    const log = (msg) => console.log(`[FlyInstaller] ${msg}`);
-    const warn = (msg) => console.warn(`[FlyInstaller] ${msg}`);
+// Hardened Security: Pinned Version
+const PINNED_VERSION = "0.2.22";
 
-    // Lazy load dependencies to ensure server starts even if they are missing
-    let AdmZip, tar;
-    try {
-        AdmZip = require('adm-zip');
-    } catch (e) {
-        throw new Error("Missing 'adm-zip'. Please run npm install.");
+// TODO: Populate with real checksums for strict security mode
+const CHECKSUMS = {
+    // "filename": "sha256_hash"
+};
+
+async function verifyChecksum(filePath, fileName) {
+    if (!CHECKSUMS[fileName]) {
+        console.warn(`[Security] No checksum found for ${fileName}. Skipping verification.`);
+        return true;
     }
     
     try {
-        tar = require('tar');
+        const fileBuffer = await fs.readFile(filePath);
+        const hash = createHash('sha256').update(fileBuffer).digest('hex');
+        
+        if (hash !== CHECKSUMS[fileName]) {
+            console.error(`[Security] Checksum Mismatch! Expected ${CHECKSUMS[fileName]}, got ${hash}`);
+            return false;
+        }
+        return true;
     } catch (e) {
-        warn("'tar' npm package missing. Will fall back to system tar.");
+        console.error(`[Security] Verification failed: ${e.message}`);
+        return false;
     }
+}
+
+async function performAntifragileInstallation() {
+    const log = (msg) => console.log(`[FlyInstaller] ${msg}`);
+    const warn = (msg) => console.warn(`[FlyInstaller] ${msg}`);
 
     const CHILD_ENV = {
         ...process.env,
@@ -62,97 +86,73 @@ async function performAntifragileInstallation() {
     log(`Starting installation to ${FLY_BIN}...`);
     const binDir = path.dirname(FLY_BIN);
 
-    // Strategy 1: Shell
-    if (!IS_WINDOWS) {
-        try {
-            log("Strategy 1: curl | sh");
-            await execa('sh', ['-c', 'curl -L https://fly.io/install.sh | sh'], {
-                env: CHILD_ENV,
-                timeout: 45000
-            });
-            if (await verify(FLY_BIN)) return FLY_BIN;
-        } catch (e) { }
-
-        try {
-            log("Strategy 1b: wget | sh");
-            await execa('sh', ['-c', 'wget -qO- https://fly.io/install.sh | sh'], {
-                env: CHILD_ENV,
-                timeout: 45000
-            });
-            if (await verify(FLY_BIN)) return FLY_BIN;
-        } catch (e) { }
-    }
-
-    // Strategy 2: Direct Download
-    log("Strategy 2: Direct Download Matrix");
+    // Strategy 1: Direct Pinned Download (Hardened)
+    log(`Strategy 1: Direct Download (Pinned v${PINNED_VERSION})`);
     try {
         const platform = os.platform();
         const arch = os.arch();
         let osName = platform === 'darwin' ? 'macOS' : platform === 'win32' ? 'Windows' : 'Linux';
         let archName = (arch === 'arm64') ? 'arm64' : (arch === 'x64' ? 'x86_64' : arch);
 
-        let versionsToTry = [];
-        try {
-            const releaseRes = await fetch('https://api.github.com/repos/superfly/flyctl/releases/latest');
-            if (releaseRes.ok) {
-                const releaseData = await releaseRes.json();
-                versionsToTry.push(releaseData.tag_name.replace(/^v/, ''));
-            }
-        } catch (e) { warn("GitHub API failed, skipping latest version check."); }
-
-        versionsToTry.push("0.4.11");
-        versionsToTry.push("0.2.22");
-        versionsToTry = [...new Set(versionsToTry)];
-
         const fileExts = platform === 'win32' ? ['.zip'] : ['.tar.gz'];
         
-        for (const version of versionsToTry) {
-            log(`Attempting version: v${version}`);
-            for (const ext of fileExts) {
-                const fileName = `flyctl_${version}_${osName}_${archName}${ext}`;
-                const url = `https://github.com/superfly/flyctl/releases/download/v${version}/${fileName}`;
+        for (const ext of fileExts) {
+            const fileName = `flyctl_${PINNED_VERSION}_${osName}_${archName}${ext}`;
+            const url = `https://github.com/superfly/flyctl/releases/download/v${PINNED_VERSION}/${fileName}`;
+            
+            try {
+                const tmpPath = path.join(VERCEL_HOME, `fly_dl_${uuidv4()}${ext}`);
+                log(`Downloading from ${url}...`);
                 
-                try {
-                    const tmpPath = path.join(VERCEL_HOME, `fly_dl_${uuidv4()}${ext}`);
-                    const response = await fetch(url);
-                    if (!response.ok) continue;
+                const response = await fetch(url);
+                if (!response.ok) {
+                    warn(`Failed to download ${fileName}: ${response.status}`);
+                    continue;
+                }
 
-                    const fileStream = createWriteStream(tmpPath);
-                    await pipeline(response.body, fileStream);
+                const fileStream = createWriteStream(tmpPath);
+                await pipeline(response.body, fileStream);
 
-                    if (ext === '.zip') {
-                        new AdmZip(tmpPath).extractAllTo(binDir, true);
-                    } else {
-                        if (tar) await tar.x({ file: tmpPath, cwd: binDir });
-                        else await execa('tar', ['-xzf', tmpPath, '-C', binDir], { env: CHILD_ENV });
-                    }
-                    await fs.unlink(tmpPath).catch(() => {});
+                // Security Check
+                if (!(await verifyChecksum(tmpPath, fileName))) {
+                     throw new Error("Checksum verification failed. Aborting installation.");
+                }
 
-                    const walk = async (dir) => {
-                        const list = await fs.readdir(dir, { withFileTypes: true });
-                        for (const item of list) {
-                            const itemPath = path.join(dir, item.name);
-                            if (item.isDirectory()) {
-                                if (await walk(itemPath)) return true;
-                            } else if (item.name === BIN_NAME) {
-                                if (itemPath !== FLY_BIN) await fs.rename(itemPath, FLY_BIN).catch(() => {});
-                                if (!IS_WINDOWS) await fs.chmod(FLY_BIN, 0o755).catch(() => {});
-                                return true;
-                            }
+                if (ext === '.zip') {
+                    new AdmZip(tmpPath).extractAllTo(binDir, true);
+                } else {
+                    if (tar) await tar.x({ file: tmpPath, cwd: binDir });
+                    else await execa('tar', ['-xzf', tmpPath, '-C', binDir], { env: CHILD_ENV });
+                }
+                await fs.unlink(tmpPath).catch(() => {});
+
+                const walk = async (dir) => {
+                    const list = await fs.readdir(dir, { withFileTypes: true });
+                    for (const item of list) {
+                        const itemPath = path.join(dir, item.name);
+                        if (item.isDirectory()) {
+                            if (await walk(itemPath)) return true;
+                        } else if (item.name === BIN_NAME) {
+                            if (itemPath !== FLY_BIN) await fs.rename(itemPath, FLY_BIN).catch(() => {});
+                            if (!IS_WINDOWS) await fs.chmod(FLY_BIN, 0o755).catch(() => {});
+                            return true;
                         }
-                        return false;
-                    };
-                    
-                    if (await walk(binDir)) {
-                         if (await verify(FLY_BIN)) {
-                             log(`✅ Successfully installed v${version}`);
-                             return FLY_BIN;
-                         }
                     }
-                } catch (dlErr) { }
+                    return false;
+                };
+                
+                if (await walk(binDir)) {
+                        if (await verify(FLY_BIN)) {
+                            log(`✅ Successfully installed v${PINNED_VERSION}`);
+                            return FLY_BIN;
+                        }
+                }
+            } catch (dlErr) {
+                warn(`Download error: ${dlErr.message}`);
             }
         }
-    } catch (e) { warn(`Strategy 2 Matrix failed: ${e.message}`); }
+    } catch (e) { warn(`Strategy 1 failed: ${e.message}`); }
+    
     throw new Error(`Installation failed.`);
 }
 
