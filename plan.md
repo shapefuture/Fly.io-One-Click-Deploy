@@ -5,9 +5,9 @@
 - [x] **Volume Logic Robustness**: Refactor the regex-based volume detection in `backend/server.js` to use a proper TOML parser (like `@iarna/toml`) for reliability. #reliability
 
 ## Phase 2: Backend Refactoring & Architecture
-- [ ] **Modularize Server**: Extract route handlers from `backend/server.js` into dedicated controllers (`controllers/deploy.js`, `controllers/analyze.js`) to reduce file size and complexity. #refactor
-- [ ] **Unified Type System**: Add JSDoc type annotations to backend services (`lib/git.js`, `strategies/ai.js`) to improve developer experience and catch type errors. #dx
-- [ ] **Structured Logging**: Replace `console.log` with a structured logger (e.g., `winston` or `pino`) for better observability in production. #ops
+- [x] **Modularize Server**: Extract route handlers from `backend/server.js` into dedicated controllers (`controllers/deploy.js`, `controllers/analyze.js`) to reduce file size and complexity. #refactor
+- [x] **Unified Type System**: Add JSDoc type annotations to backend services (`lib/git.js`, `strategies/ai.js`) to improve developer experience and catch type errors. #dx
+- [x] **Structured Logging**: Replace `console.log` with a structured logger (e.g., `winston` or `pino`) for better observability in production. #ops
 
 ## Phase 3: AI & Analysis Engine Enhancements
 - [ ] **Context Window Optimization**: Improve the context slicing logic in `backend/strategies/ai.js`. Instead of a hard 12000 char limit, prioritize specific files (`package.json` > `Dockerfile` > `fly.toml`) and truncate less critical ones. #ai

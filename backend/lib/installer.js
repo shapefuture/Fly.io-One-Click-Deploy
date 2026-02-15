@@ -10,13 +10,14 @@ import { createHash } from 'crypto';
 import { IS_WINDOWS, IS_VERCEL, BIN_NAME, VERCEL_HOME, FLY_INSTALL_DIR, FLY_BIN } from './config.js';
 
 const require = createRequire(import.meta.url);
-const AdmZip = require('adm-zip');
 
-let tar;
+// Robust Require for CJS deps
+let AdmZip, tar;
 try {
+    AdmZip = require('adm-zip');
     tar = require('tar');
 } catch (e) {
-    console.warn("⚠️ Warning: 'tar' npm package is missing. Fallback to system tar will be used.");
+    console.warn("⚠️ Critical Dependency Missing:", e.message);
 }
 
 let flyBinPath = null;
@@ -33,7 +34,6 @@ const CHECKSUMS = {
 
 async function verifyChecksum(filePath, fileName) {
     if (!CHECKSUMS[fileName]) {
-        console.warn(`[Security] No checksum found for ${fileName}. Skipping verification.`);
         return true;
     }
     
@@ -55,6 +55,8 @@ async function verifyChecksum(filePath, fileName) {
 async function performAntifragileInstallation() {
     const log = (msg) => console.log(`[FlyInstaller] ${msg}`);
     const warn = (msg) => console.warn(`[FlyInstaller] ${msg}`);
+
+    if (!AdmZip || !tar) throw new Error("Missing required dependencies (adm-zip or tar)");
 
     const CHILD_ENV = {
         ...process.env,
@@ -104,6 +106,11 @@ async function performAntifragileInstallation() {
                 const tmpPath = path.join(VERCEL_HOME, `fly_dl_${uuidv4()}${ext}`);
                 log(`Downloading from ${url}...`);
                 
+                // Fetch availability check
+                if (typeof fetch === 'undefined') {
+                     throw new Error("Global fetch is unavailable. Node 18+ required.");
+                }
+
                 const response = await fetch(url);
                 if (!response.ok) {
                     warn(`Failed to download ${fileName}: ${response.status}`);
@@ -121,8 +128,7 @@ async function performAntifragileInstallation() {
                 if (ext === '.zip') {
                     new AdmZip(tmpPath).extractAllTo(binDir, true);
                 } else {
-                    if (tar) await tar.x({ file: tmpPath, cwd: binDir });
-                    else await execa('tar', ['-xzf', tmpPath, '-C', binDir], { env: CHILD_ENV });
+                    await tar.x({ file: tmpPath, cwd: binDir });
                 }
                 await fs.unlink(tmpPath).catch(() => {});
 
